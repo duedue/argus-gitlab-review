@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Argus — Self-hosted AI code review for GitLab</title>
+<meta name="description" content="Argus is a self-hosted AI reviewer for GitLab merge requests. Assigned as a reviewer, it reviews with your own skill and your own Claude subscription, then comments under your GitLab identity.">
+<meta name="color-scheme" content="light dark">
+<link rel="canonical" href="https://duedue.github.io/argus-gitlab-review/">
+<link rel="alternate" hreflang="en" href="https://duedue.github.io/argus-gitlab-review/">
+<link rel="alternate" hreflang="zh-TW" href="https://duedue.github.io/argus-gitlab-review/zh-TW/">
+<link rel="alternate" hreflang="x-default" href="https://duedue.github.io/argus-gitlab-review/">
+<link rel="icon" type="image/png" href="assets/favicon.png">
+<link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Argus">
+<meta property="og:title" content="Argus — Self-hosted AI code review for GitLab">
+<meta property="og:description" content="Assigned as a reviewer, Argus reviews the merge request with your own skill and comments under your GitLab identity. Read-only agent, deterministic writes, dry-run by default.">
+<meta property="og:url" content="https://duedue.github.io/argus-gitlab-review/">
+<meta property="og:image" content="https://duedue.github.io/argus-gitlab-review/assets/argus-icon-512.png">
+<meta property="og:image:alt" content="Argus logo: a golden multi-eyed emblem on a dark navy background">
+<meta property="og:locale" content="en_US">
+<meta property="og:locale:alternate" content="zh_TW">
+<meta name="twitter:card" content="summary">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="./"><img src="assets/favicon.png" alt="" width="32" height="32">Argus</a>
+    <nav class="site-nav" aria-label="Main">
+      <span class="nav-links">
+        <a href="#how">How it works</a>
+        <a href="#security">Security</a>
+        <a href="#quickstart">Quick start</a>
+      </span>
+      <a href="https://github.com/duedue/argus-gitlab-review">GitHub</a>
+      <a class="lang" href="zh-TW/" hreflang="zh-TW" lang="zh-TW">繁體中文</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+  <section class="hero">
+    <div class="wrap">
+      <img class="logo" src="assets/argus-icon-512.png" alt="Argus logo: a golden multi-eyed emblem on a dark navy background" width="96" height="96">
+      <h1>Your review skill, on every merge request.</h1>
+      <p class="lead">Argus is a self-hosted AI reviewer for GitLab. When you are assigned as a reviewer, it reviews the merge request with your own skill and leaves inline comments and a summary under your GitLab identity.</p>
+      <div class="actions">
+        <a class="btn btn-primary" href="#quickstart">Get started</a>
+        <a class="btn" href="https://github.com/duedue/argus-gitlab-review">View on GitHub</a>
+      </div>
+      <p class="meta">Open source · MIT · Docker Compose</p>
+    </div>
+  </section>
+
+  <section class="block alt" id="how" aria-labelledby="how-h">
+    <div class="wrap">
+      <h2 id="how-h">How it works</h2>
+      <p class="sub">No webhooks to set up. Argus watches for merge requests where you are a reviewer.</p>
+      <ol class="grid c3">
+        <li class="card step"><span class="num" aria-hidden="true">1</span><h3>Get assigned as reviewer</h3><p>Argus polls GitLab every 30 seconds for open merge requests that list you as a reviewer. Want it instant? Call the trigger API right after the MR is created.</p></li>
+        <li class="card step"><span class="num" aria-hidden="true">2</span><h3>It reviews automatically</h3><p>Claude Code runs read-only on a shallow clone of the repository, guided by your own review skill and the diff.</p></li>
+        <li class="card step"><span class="num" aria-hidden="true">3</span><h3>Comments, then follow-up</h3><p>Findings land as inline discussions plus one summary, under your name. After each push, only the new changes are reviewed and fixed threads are resolved.</p></li>
+      </ol>
+    </div>
+  </section>
+
+  <section class="block" id="features" aria-labelledby="feat-h">
+    <div class="wrap">
+      <h2 id="feat-h">What you get</h2>
+      <p class="sub">One Argus can serve a whole team. Everyone brings their own login, skill and subscription.</p>
+      <ul class="grid c3">
+        <li class="card"><h3>Your skill, your voice</h3><p>Each user uploads their own <code>SKILL.md</code> and sets their own thresholds, comment language and model.</p></li>
+        <li class="card"><h3>Your own Claude subscription</h3><p>Every user signs in with GitLab OAuth and pastes a token from <code>claude setup-token</code>. Usage counts against their own plan, never someone else's.</p></li>
+        <li class="card"><h3>Incremental re-review</h3><p>Only the diff since the last reviewed commit is checked. Earlier findings are tracked as fixed or still open, and fixed inline threads are resolved for you.</p></li>
+        <li class="card"><h3>You make the call</h3><p>Reply <code>/argus accept</code> on a finding you consider fine. Argus resolves it and recomputes the verdict without re-running the AI.</p></li>
+        <li class="card"><h3>Trigger API</h3><p>Let your coding agent request a review the moment it opens a merge request. Each user has their own API key.</p></li>
+        <li class="card"><h3>Optional extras</h3><p>Opt-in auto-approve under your own name when a round is clean. Optional Jira requirement context (Server / Data Center).</p></li>
+        <li class="card"><h3>Review history</h3><p>See every round per merge request, with status, findings and the model that actually ran. Failed runs retry automatically.</p></li>
+        <li class="card"><h3>Simple to run</h3><p>One Node process, SQLite storage and a plain server-rendered web UI. Deploy with Docker Compose.</p></li>
+        <li class="card"><h3>Multi-user, owner approved</h3><p>New sign-ups wait until the owner approves them, so nobody gets reviews they did not ask for.</p></li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="block alt" id="screens" aria-labelledby="scr-h">
+    <div class="wrap">
+      <h2 id="scr-h">See it in action</h2>
+      <p class="sub">Illustrative examples with made-up names and data. The Argus web interface is in Traditional Chinese.</p>
+      <div class="show two">
+        <figure>
+          <div class="mock" role="group" aria-label="Example of an Argus summary comment on a merge request">
+            <div class="who"><img src="assets/favicon.png" alt="" width="28" height="28"><div><strong>alice</strong> · Argus review, round 2<small>Posted under alice's GitLab identity</small></div></div>
+            <p>Verdict: <strong>changes requested</strong>. 1 open, 1 fixed since the last round, 1 accepted by the reviewer.</p>
+            <h4>Findings</h4>
+            <ul>
+              <li><span class="tag open">open</span><strong>minor</strong> <code>src/auth/session.ts:58</code><br>The session cookie has no expiry, so it outlives the login.</li>
+              <li><span class="tag fixed">fixed</span><code>src/api/orders.ts:112</code><br>Missing null check on <code>order.items</code>. Thread resolved.</li>
+              <li><span class="tag acc">accepted</span><code>src/jobs/sync.ts:30</code><br>Retry loop has no cap. Accepted: tracked in PROJ-123.</li>
+            </ul>
+            <div class="reply"><code>/argus accept tracked in PROJ-123</code></div>
+          </div>
+          <figcaption>A summary round on a merge request. Open items stay visible, fixed ones are closed for you, and accepted ones drop out of the verdict.</figcaption>
+        </figure>
+        <div class="stack">
+        <figure>
+          <picture>
+            <source srcset="assets/shot-reviews-dark.png" media="(prefers-color-scheme: dark)">
+            <img src="assets/shot-reviews-light.png" width="1200" height="520" alt="Argus review history page: reviews grouped by merge request, the first group expanded to show three rounds with status, model and findings count.">
+          </picture>
+          <figcaption>Review history, grouped by merge request. Expand a group to see each round. (Interface in Traditional Chinese.)</figcaption>
+        </figure>
+        <figure>
+          <picture>
+            <source srcset="assets/shot-settings-dark.png" media="(prefers-color-scheme: dark)">
+            <img src="assets/shot-settings-light.png" width="1200" height="640" alt="Argus settings page, Claude token card: a status badge shows the token is set, with notes that it is stored encrypted and used only for your reviews.">
+          </picture>
+          <figcaption>Settings: each user connects their own Claude subscription. The token is never shown again after saving. (Interface in Traditional Chinese.)</figcaption>
+        </figure>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="block" id="security" aria-labelledby="sec-h">
+    <div class="wrap">
+      <h2 id="sec-h">Security by design</h2>
+      <p class="sub">An AI that reads untrusted code should not hold your keys. Argus keeps the two apart.</p>
+      <ul class="checks">
+        <li><strong>Tokens never reach the AI</strong><span>The agent only gets <code>Read</code>, <code>Grep</code> and <code>Glob</code> on a shallow clone. Your GitLab and Claude tokens stay outside its context.</span></li>
+        <li><strong>Deterministic code does every write</strong><span>Comments, resolves and approvals are posted by plain code from the agent's structured findings, not by the model calling tools.</span></li>
+        <li><strong>Dry-run by default</strong><span>Reviews run and are recorded, but nothing is posted until the owner switches to live mode.</span></li>
+        <li><strong>Encrypted at rest</strong><span>Stored tokens are encrypted with AES-256-GCM. The web UI uses CSRF tokens, a strict content security policy and hashed session ids.</span></li>
+        <li><strong>Careful auto-approve</strong><span>Off unless you opt in. It is bound to the exact reviewed commit and only ever revokes approvals Argus made itself.</span></li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="block alt" id="quickstart" aria-labelledby="qs-h">
+    <div class="wrap">
+      <h2 id="qs-h">Quick start</h2>
+      <p class="sub">Docker with Compose v2 is all you need on the host.</p>
+<pre tabindex="0"><code>git clone https://github.com/duedue/argus-gitlab-review.git &amp;&amp; cd argus-gitlab-review
+cp .env.example .env &amp;&amp; chmod 600 .env
+openssl rand -base64 32          <span class="c"># put the output in ARGUS_MASTER_KEY</span>
+$EDITOR .env                     <span class="c"># set BASE_URL, GITLAB_URL, ARGUS_MASTER_KEY</span>
+docker compose up -d --build</code></pre>
+      <p class="after">Then open <code>BASE_URL</code>. The first run lands on <code>/setup</code>, which asks for the one-time setup code from the container log, your GitLab OAuth application credentials and the owner's GitLab user id. After that, sign in with GitLab, upload a skill and paste your Claude token. Switch from dry-run to live on the admin page when the results look right.</p>
+      <p class="after">Full walkthrough: <a href="https://github.com/duedue/argus-gitlab-review/blob/main/docs/SETUP.md">docs/SETUP.md</a> (Traditional Chinese) and the <a href="https://github.com/duedue/argus-gitlab-review#readme">README</a>.</p>
+    </div>
+  </section>
+
+  <section class="block" id="requirements" aria-labelledby="req-h">
+    <div class="wrap">
+      <h2 id="req-h">Requirements &amp; limitations</h2>
+      <ul class="reqs">
+        <li><strong>Claude subscription.</strong> Each user needs their own. Without a token, that user's reviews are skipped, and Argus never falls back to the owner's subscription.</li>
+        <li><strong>GitLab OAuth application.</strong> Confidential, with scopes <code>api</code> and <code>read_repository</code>. Tested with GitLab 15.11.</li>
+        <li><strong>Jira is optional, and Server / Data Center only.</strong> Jira Cloud is not supported.</li>
+        <li><strong>The web interface and the in-depth guides are in Traditional Chinese.</strong> This site and the README are the English entry points. Review comment language is a per-user setting.</li>
+        <li><strong>Polling, not webhooks.</strong> Reviews start within about 30 seconds, or instantly through the trigger API.</li>
+        <li><strong>Large diffs are not reviewed.</strong> Argus asks the author to split the merge request instead. Draft merge requests are skipped.</li>
+      </ul>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>Argus is open source under the <a href="https://github.com/duedue/argus-gitlab-review/blob/main/LICENSE">MIT License</a>.</span>
+    <span><a href="https://github.com/duedue/argus-gitlab-review">GitHub</a> · <a href="zh-TW/" hreflang="zh-TW" lang="zh-TW">繁體中文</a></span>
+  </div>
+</footer>
+</body>
+</html>

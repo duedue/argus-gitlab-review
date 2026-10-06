@@ -1,5 +1,9 @@
 # Argus
 
+<img src="docs/images/argus-icon.png" alt="Argus logo" width="72" align="right">
+
+**Website: <https://duedue.github.io/argus-gitlab-review/>** ([繁體中文](https://duedue.github.io/argus-gitlab-review/zh-TW/))
+
 Argus is a self-hosted GitLab merge-request reviewer. It polls GitLab for open MRs where **you** are a reviewer, reviews them with an AI coding agent (`claude -p`, read-only, in a shallow clone) using **your own review skill**, and posts the findings as inline discussions plus a summary comment under your GitLab identity. Several people can share one Argus: each user brings their own GitLab login, skill, thresholds and Claude subscription.
 
 The in-app UI and the detailed guides in `docs/` are written in Traditional Chinese; this README is the English entry point.
