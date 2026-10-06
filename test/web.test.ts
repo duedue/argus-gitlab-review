@@ -445,20 +445,20 @@ test("docs: MR author guide is public and linked from the footer", async () => {
   const res = await app.request("/docs/mr");
   assert.equal(res.status, 200);
   const body = await res.text();
-  assert.ok(body.includes("<title>Argus：MR 作者須知 - Argus"));
-  assert.match(body, /2000 行/);
+  assert.ok(body.includes("<title>Argus: Guide for MR authors - Argus"));
+  assert.match(body, /2000 lines/);
   assert.match(body, /href="\/docs\/mr"/);
 });
 
 test("docs: both guides are public and rendered", async () => {
   const { app } = setup();
-  for (const [path, h1] of [["/docs/setup", "部署指南"], ["/docs/guide", "使用指南"]] as const) {
+  for (const [path, h1] of [["/docs/setup", "Setup guide"], ["/docs/guide", "User guide"]] as const) {
     const res = await app.request(path);
     assert.equal(res.status, 200);
     assert.match(res.headers.get("content-security-policy")!, /default-src 'self'/);
     const body = await res.text();
-    assert.ok(body.includes(`<title>Argus：${h1} - Argus`), `${path} title from H1`);
-    assert.match(body, /<h1>Argus：/);
+    assert.ok(body.includes(`<title>Argus: ${h1} - Argus`), `${path} title from H1`);
+    assert.match(body, /<h1>Argus: /);
     assert.match(body, /<table>/);
     assert.match(body, /<pre class="codeblock"/);
     assert.doesNotMatch(body, /style=/);

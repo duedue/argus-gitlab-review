@@ -148,7 +148,7 @@ openssl rand -base64 32          <span class="c"># put the output in ARGUS_MASTE
 $EDITOR .env                     <span class="c"># set BASE_URL, GITLAB_URL, ARGUS_MASTER_KEY</span>
 docker compose up -d --build</code></pre>
       <p class="after">接著開啟 <code>BASE_URL</code>。第一次會進入 <code>/setup</code>，需要容器日誌中的一次性 setup code、你的 GitLab OAuth application 憑證，以及 owner 的 GitLab user id。之後用 GitLab 登入、上傳 skill、貼上你的 Claude token。結果看起來沒問題後，再到管理頁把 dry-run 切成正式模式。</p>
-      <p class="after">完整步驟：<a href="https://github.com/duedue/argus-gitlab-review/blob/main/docs/SETUP.md">docs/SETUP.md</a>，另有 <a href="https://github.com/duedue/argus-gitlab-review#readme">README</a>（英文）。</p>
+      <p class="after">完整步驟：<a href="https://github.com/duedue/argus-gitlab-review/blob/main/docs/SETUP.md">docs/SETUP.md</a>（英文），另有 <a href="https://github.com/duedue/argus-gitlab-review#readme">README</a>（英文）。</p>
     </div>
   </section>
 
@@ -159,7 +159,7 @@ docker compose up -d --build</code></pre>
         <li><strong>Claude 訂閱。</strong>每位使用者需要自己的訂閱。沒有 token 的使用者，審查會被略過，Argus 不會改用 owner 的訂閱。</li>
         <li><strong>GitLab OAuth application。</strong>需為 confidential，scope 為 <code>api</code> 與 <code>read_repository</code>。已在 GitLab 15.11 測試。</li>
         <li><strong>Jira 為選用，且僅支援 Server / Data Center。</strong>不支援 Jira Cloud。</li>
-        <li><strong>Web UI 與詳細文件為繁體中文。</strong>留言語言可由每位使用者自行設定。</li>
+        <li><strong>Web UI 為繁體中文，詳細文件（<code>docs/</code>）為英文。</strong>留言語言可由每位使用者自行設定。</li>
         <li><strong>採輪詢而非 webhook。</strong>約 30 秒內開始審查，使用 trigger API 則可即時。</li>
         <li><strong>過大的 diff 不審查。</strong>Argus 會請作者拆分 MR。Draft MR 會被略過。</li>
       </ul>

@@ -1,181 +1,183 @@
-# Argus：部署指南
+# Argus: Setup guide
 
-給部署者（owner）：用 Docker Compose 部署 Argus。使用者只需要使用 Argus，請看 [USER-GUIDE.md](USER-GUIDE.md)。設計背景見 [DESIGN.md](DESIGN.md)。
+For the deployer (owner): deploy Argus with Docker Compose. Users only need to use Argus; see [USER-GUIDE.md](USER-GUIDE.md). For design background, see [DESIGN.md](DESIGN.md).
 
-本指南的指令都在 `docker-compose.yml` 所在目錄執行。本機開發（不用 Docker）見 [README](../README.md) 的 Development 一節。
+Run every command in this guide from the directory containing `docker-compose.yml`. For local development without Docker, see the Development section of the [README](../README.md).
 
-## 1. 先決條件
+Note: the Argus web UI is in Traditional Chinese. UI labels are given here in English with the original text in parentheses, so you can find them in the interface.
 
-| 項目 | 說明 |
+## 1. Prerequisites
+
+| Item | Details |
 |---|---|
-| 主機 | 能跑 Docker Engine 與 Docker Compose v2 的 Linux／macOS 主機（x86_64 或 arm64），建議 RAM ≥ 2 GB |
-| 網路 | 容器能連到你的 GitLab、`api.anthropic.com`；若使用 Jira 需能連到 Jira。使用者的瀏覽器要連得到 Argus 的 `BASE_URL` |
-| GitLab | 能建立 OAuth Application。已測試版本 15.11 |
-| Jira（選填） | 目前只支援 Jira Server／Data Center（Bearer token、REST v2），不支援 Jira Cloud |
-| Claude 訂閱 | owner 自己的 Claude 帳號（審查 owner 的 MR）。其他使用者各自用自己的訂閱，在設定頁貼 Claude token（`claude setup-token`） |
+| Host | A Linux/macOS host (x86_64 or arm64) that can run Docker Engine and Docker Compose v2; RAM >= 2 GB recommended |
+| Network | The container can reach your GitLab and `api.anthropic.com`, and Jira if you use it. Users' browsers can reach Argus's `BASE_URL` |
+| GitLab | Ability to create an OAuth Application. Tested with version 15.11 |
+| Jira (optional) | Jira Server / Data Center only (Bearer token, REST v2); Jira Cloud is not supported |
+| Claude subscription | The owner's own Claude account (reviews the owner's MRs). Other users use their own subscriptions and paste their Claude token (`claude setup-token`) on the Settings page |
 
-## 2. 安裝 / 升級
+## 2. Install / upgrade
 
 ```sh
-git clone <本專案網址> argus-gitlab-review && cd argus-gitlab-review
+git clone <this project's URL> argus-gitlab-review && cd argus-gitlab-review
 cp .env.example .env && chmod 600 .env
-openssl rand -base64 32      # 產生主金鑰，貼到 .env 的 ARGUS_MASTER_KEY
-$EDITOR .env                 # 至少填 BASE_URL、GITLAB_URL、ARGUS_MASTER_KEY
+openssl rand -base64 32      # generate the master key; paste it into ARGUS_MASTER_KEY in .env
+$EDITOR .env                 # fill in at least BASE_URL, GITLAB_URL, ARGUS_MASTER_KEY
 docker compose up -d --build
 ```
 
-- 缺 `BASE_URL` 或 `GITLAB_URL` 時 `docker compose` 會直接報錯，不會啟動；`GITLAB_URL` 沒設也會讓程式啟動失敗並提示。
-- 映像內含 `claude` 與 `codex` CLI（版本固定在 `Dockerfile`），不需要另外安裝。
-- 預設發佈 `3000` port（`ARGUS_PORT` 可改）。要給別人用，請放在反向代理（TLS）後面，並把 `BASE_URL` 設成對外網址。
+- If `BASE_URL` or `GITLAB_URL` is missing, `docker compose` errors out and does not start; a missing `GITLAB_URL` also makes the app fail at startup with a message.
+- The image includes the `claude` and `codex` CLIs (versions pinned in the `Dockerfile`); no separate installation is needed.
+- Port `3000` is published by default (change with `ARGUS_PORT`). To serve other people, put it behind a reverse proxy (TLS) and set `BASE_URL` to the public URL.
 
-**升級**：`git pull`，再執行 `docker compose up -d --build`。設定、資料與 Claude 登入都在 volume，會保留。
+**Upgrade**: `git pull`, then `docker compose up -d --build`. Settings, data, and the Claude login live in volumes and are kept.
 
-## 3. 首次設定
+## 3. First-time setup
 
-1. 瀏覽器開 `BASE_URL`，自動導向 `/setup`。
-2. 取得 Setup code（格式 `XXXX-XXXX-XXXX-XXXX`，不分大小寫）。進入設定模式時 Argus 會在容器日誌印出一行，也存在 `/data/setup-code`：
+1. Open `BASE_URL` in a browser; it redirects to `/setup`.
+2. Get the Setup code (format `XXXX-XXXX-XXXX-XXXX`, case-insensitive). Argus prints one line to the container log when it enters setup mode, and also stores it in `/data/setup-code`:
 
    ```sh
    docker compose logs argus | grep "Setup code"
    docker compose exec argus cat /data/setup-code
    ```
 
-3. 到 GitLab：Preferences → Applications，新增 Application：
+3. In GitLab, go to Preferences -> Applications and add an Application:
 
-   | 欄位 | 值 |
+   | Field | Value |
    |---|---|
-   | Redirect URI | `/setup` 頁面「Redirect URI」顯示的網址（`<BASE_URL>/auth/callback`），必須完全一致 |
-   | Confidential | 勾選 |
-   | Scopes | `api`、`read_repository` |
+   | Redirect URI | The URL shown as "Redirect URI" (「Redirect URI」) on the `/setup` page (`<BASE_URL>/auth/callback`); it must match exactly |
+   | Confidential | Checked |
+   | Scopes | `api`, `read_repository` |
 
-   之後要加網址（例如改網域），在**同一個** Application 的 Redirect URI 多加一行，不要另開重複的 Application。儲存後記下 Application ID 與 Secret（Secret 只顯示一次）。
+   To add another URL later (e.g. a domain change), add another line to the Redirect URI of the **same** Application; do not create a duplicate Application. After saving, note the Application ID and Secret (the Secret is shown only once).
 
-4. 回 `/setup` 填入並按「儲存並繼續」：
+4. Go back to `/setup`, fill in the fields, and click **Save and continue** (「儲存並繼續」):
 
-   | 欄位 | 說明 |
+   | Field | Details |
    |---|---|
-   | Application ID / Secret | 上一步取得 |
-   | Owner 的 GitLab 使用者 ID（建議）或帳號名稱 | 優先填數字 ID（GitLab 個人頁面，或 `/api/v4/user` 的 `id`），改名也不會變；帳號名稱可能被改名搶用，填名稱時請立刻登入並到「使用者管理」確認 |
-   | Jira API token（選填） | 有填、且 `.env` 有設 `JIRA_URL` 才會讀取 MR 關聯的 Jira 需求 |
-   | Setup code | 上一步取得；用過即失效 |
+   | Application ID / Secret | From the previous step |
+   | Owner's GitLab user ID (recommended) or username | Prefer the numeric ID (on the GitLab profile page, or `id` from `/api/v4/user`); it does not change when the account is renamed. A username can be taken over after a rename, so if you enter a username, log in right away and verify it under User management (「使用者管理」) |
+   | Jira API token (optional) | Argus reads the Jira requirement linked to an MR only if this is filled in and `JIRA_URL` is set in `.env` |
+   | Setup code | From the previous step; it is invalidated once used |
 
-5. 自動導向登入頁，按「使用 GitLab 登入」並授權。你就是 owner。
+5. You are redirected to the login page. Click **Log in with GitLab** (「使用 GitLab 登入」) and authorize. You are the owner.
 
-也可以跳過 `/setup`：在 `.env` 設 `OAUTH_CLIENT_ID`、`OAUTH_CLIENT_SECRET` 與 `ARGUS_OWNER`，執行 `docker compose up -d`。
+You can also skip `/setup`: set `OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET`, and `ARGUS_OWNER` in `.env` and run `docker compose up -d`.
 
-## 4. 登入 Claude
+## 4. Log in to Claude
 
-審查引擎是 Claude Code。owner 的審查跑在容器內的 `claude` 登入（本節）；其他使用者各自在「設定」貼自己的 Claude token（見 [USER-GUIDE](USER-GUIDE.md) 第 2 節），不會用到 owner 的訂閱。owner 也可以改貼個人 Claude token，有貼就優先使用，不必做本節的容器登入。
+The review engine is Claude Code. The owner's reviews run on the `claude` login inside the container (this section). Other users paste their own Claude token under Settings (「設定」; see section 2 of the [USER-GUIDE](USER-GUIDE.md)) and never use the owner's subscription. The owner can also paste a personal Claude token instead; if one is set, it takes priority and the container login in this section is unnecessary.
 
-1. 開 `/admin`，看「引擎狀態」卡片的 Claude (claude-cli)；顯示「未登入」就照卡片上的指令做。
-2. 在主機上執行：
+1. Open `/admin` and find the Claude (claude-cli) entry in the "Engine status" card (「引擎狀態」). If it shows "Not logged in" (「未登入」), follow the instructions on the card.
+2. On the host, run:
 
    ```sh
    docker compose exec argus claude
    ```
 
-   在 claude 內輸入 `/login`，瀏覽器完成授權，把授權碼貼回終端機，輸入 `/exit`。
-3. 回 `/admin`，按「重新檢查登入狀態」，再按「測試連線」（實際呼叫一次模型，每 30 秒限 1 次）。看到「測試成功」與實際模型即完成。
-4. 到「設定」上傳你的 `SKILL.md`（審查規則）。
+   In claude, enter `/login`, complete the authorization in the browser, paste the authorization code back into the terminal, and enter `/exit`.
+3. Back on `/admin`, click **Re-check login status** (「重新檢查登入狀態」), then **Test connection** (「測試連線」; it makes one real model call, limited to 1 per 30 seconds). When you see "Test succeeded" (「測試成功」) and the actual model, you are done.
+4. Under Settings (「設定」), upload your `SKILL.md` (the review rules).
 
-登入資訊存在 Docker volume（`claude-home`），升級與重啟不會遺失。
+Login data is stored in a Docker volume (`claude-home`) and survives upgrades and restarts.
 
-> 其他同事登入後為「等待核准」，到 `/admin` 按「核准」，且他們在「設定」貼上自己的 Claude token 後才會被審查。`/admin` 使用者表的「Claude token」欄顯示每人狀態（已設定／未設定／失效／使用 owner 容器登入），「最近一次審查」欄顯示最後一筆結果，例如「略過（未設定 token）」。表上不會顯示任何 token 內容。
+> Other colleagues are in "Awaiting approval" (「等待核准」) after they log in. Click **Approve** (「核准」) for them on `/admin`; they are reviewed only after they paste their own Claude token under Settings. The "Claude token" column of the `/admin` user table shows each person's status (set / not set / invalid / uses owner's container login; 「已設定」「未設定」「失效」「使用 owner 容器登入」), and the "Last review" column (「最近一次審查」) shows the latest result, e.g. "Skipped (token not set)" (「略過（未設定 token）」). The table never shows any token content.
 
-## 5. 正式上線（審查發佈模式）
+## 5. Going live (review publish mode)
 
-新安裝預設為 **Dry-run**：審查照跑、結果記在「審查紀錄」（帶 `dry-run` 標籤），但**不會**在 MR 留言、也不會自動 approve。確認結果合理後，不需要改 `.env`：
+A new installation starts in **Dry-run**: reviews run and results are recorded in Review history (「審查紀錄」, with a `dry-run` label), but Argus does **not** comment on MRs or auto-approve. Once the results look reasonable, you do not need to edit `.env`:
 
-1. 以 owner 身分開 `/admin`，找到「審查發佈模式」卡片。
-2. 勾選確認（Argus 會以各審查者自己的 GitLab 帳號發 comment），按「切換為正式模式」。立即生效，不需重啟；要退回只記錄，按「切換為 Dry-run」即可。
+1. Open `/admin` as the owner and find the "Review publish mode" card (「審查發佈模式」).
+2. Check the confirmation box (Argus will post comments under each reviewer's own GitLab account) and click **Switch to live mode** (「切換為正式模式」). It takes effect immediately with no restart; to go back to record-only, click **Switch to Dry-run** (「切換為 Dry-run」).
 
-> 切換為正式後，**目前所有已用 dry-run 審過、仍 open 的 MR 會在下一輪（約 30 秒內）重新審查並發佈 comment**，不只影響之後的新 commit；引擎用量也會短暫增加。切換模式時，前一模式中「等待自動重試」的失敗審查會直接結束（不再重試），僅保留為歷史紀錄；新模式會在下一輪自動重新審查仍 open 的 MR。
+> After switching to live, **every open MR that was previously reviewed in dry-run is re-reviewed on the next cycle (within about 30 seconds) and its comments are published**, not just new commits afterward; engine usage also rises briefly. When you switch modes, failed reviews that were "waiting for automatic retry" in the previous mode end immediately (no more retries) and remain only as history; the new mode re-reviews still-open MRs on the next cycle.
 
-卡片會標示目前狀態與來源（網頁設定／`.env` 鎖定）。**若 `.env` 有 `DRY_RUN`（任何非空值，只有 `0` 代表正式），它優先於網頁設定，卡片上的按鈕會停用**。要改由網頁管理：把 `.env` 內的 `DRY_RUN` 那一行清空或刪除，再執行：
+The card shows the current state and its source (web setting / locked by `.env`; 「網頁設定」「.env 鎖定」). **If `.env` has `DRY_RUN` set (any non-empty value; only `0` means live), it takes priority over the web setting and the buttons on the card are disabled.** To manage it from the web instead, clear or delete the `DRY_RUN` line in `.env`, then run:
 
 ```sh
 docker compose up -d
 ```
 
-## 6. 維運指令
+## 6. Operations commands
 
-| 目的 | 指令 |
+| Purpose | Command |
 |---|---|
-| 啟動／更新設定 | `docker compose up -d`（`.env` 改動後用這個；它會重建容器套用新環境變數） |
-| 重啟（不改設定） | `docker compose restart` |
-| 停止（保留 volume） | `docker compose stop`；`docker compose down` 會移除容器但保留 volume |
-| 狀態 | `docker compose ps` |
-| 日誌 | `docker compose logs -f argus` |
-| 顯示目前的 Setup code（已設定完成則無） | `docker compose exec argus cat /data/setup-code` |
-| 清除網頁存的 OAuth／owner／Jira 設定，回到 `/setup` | `docker compose exec argus npm run cli -- setup reset`，再 `docker compose restart`；`.env` 有 `OAUTH_*` 時不會生效（環境變數優先） |
-| 登入 Claude | `docker compose exec argus claude`，再輸入 `/login` |
-| 登入 Codex（實驗功能，見第 9 節） | `docker compose exec argus codex login --device-auth` |
-| 使用者管理 CLI | `docker compose exec argus npm run cli -- user list`（其餘子指令見 README） |
+| Start / apply config changes | `docker compose up -d` (use this after editing `.env`; it recreates the container with the new environment variables) |
+| Restart (no config change) | `docker compose restart` |
+| Stop (keep volumes) | `docker compose stop`; `docker compose down` removes the container but keeps volumes |
+| Status | `docker compose ps` |
+| Logs | `docker compose logs -f argus` |
+| Show the current Setup code (none once setup is complete) | `docker compose exec argus cat /data/setup-code` |
+| Clear the OAuth / owner / Jira settings stored via the web and return to `/setup` | `docker compose exec argus npm run cli -- setup reset`, then `docker compose restart`; has no effect when `.env` sets `OAUTH_*` (environment variables take priority) |
+| Log in to Claude | `docker compose exec argus claude`, then enter `/login` |
+| Log in to Codex (experimental, see section 9) | `docker compose exec argus codex login --device-auth` |
+| User management CLI | `docker compose exec argus npm run cli -- user list` (other subcommands: see the README) |
 
-> `docker compose restart` **不會**重新讀取 `.env`；改過 `.env` 請用 `docker compose up -d`。
+> `docker compose restart` does **not** re-read `.env`; after editing `.env`, use `docker compose up -d`.
 
-## 7. `.env` 與資料
+## 7. `.env` and data
 
-`.env` 位於 compose 目錄。**環境變數優先於 `/setup` 存進資料庫的值**；改完執行 `docker compose up -d`。完整範本見 `.env.example`。
+`.env` lives in the compose directory. **Environment variables take priority over values saved in the database by `/setup`**; after editing, run `docker compose up -d`. See `.env.example` for the full template.
 
-| Key | 說明 |
+| Key | Details |
 |---|---|
-| `ARGUS_MASTER_KEY` | 必填。`openssl rand -base64 32` 產生。**遺失 = 已存的 token 全部無法解密**，請另行備份。 |
-| `BASE_URL` | 必填。使用者瀏覽器看到的對外網址，必須與 OAuth Redirect URI 前綴一致；`https://` 開頭會啟用 Secure cookie |
-| `GITLAB_URL` | 必填。你的 GitLab 網址 |
-| `JIRA_URL`、`JIRA_API_TOKEN` | 選填；兩者都有才會讀取 Jira 需求，否則停用。僅支援 Jira Server／Data Center |
-| `DRY_RUN` | 選填，留空即可。有設就鎖定發佈模式（`0` = 正式，其他值 = Dry-run），`/admin` 的切換鈕停用；不設則由 `/admin` 管理（預設 Dry-run）。見第 5 節 |
-| `ARGUS_PORT` | 預設 3000，主機端 port |
-| `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` | 選填；有設就不進 `/setup` 設定模式 |
-| `ARGUS_OWNER` | 選填；GitLab 使用者 ID 或帳號。只在「尚無 owner」時生效 |
-| `REVIEW_CONCURRENCY` | 選填，預設 `3`。全站同時執行的審查上限（每個審查是一個 `claude` 程序）。同一位使用者的審查一律依序執行，不同使用者才會並行。須為 ≥ 1 的整數，其他值視為 3 |
+| `ARGUS_MASTER_KEY` | Required. Generate with `openssl rand -base64 32`. **If lost, all stored tokens can no longer be decrypted**; back it up separately. |
+| `BASE_URL` | Required. The public URL users see in their browsers; it must match the prefix of the OAuth Redirect URI. A URL starting with `https://` enables Secure cookies |
+| `GITLAB_URL` | Required. Your GitLab URL |
+| `JIRA_URL`, `JIRA_API_TOKEN` | Optional; Jira requirements are read only if both are set, otherwise disabled. Jira Server / Data Center only |
+| `DRY_RUN` | Optional; leave empty. If set, it locks the publish mode (`0` = live, any other value = Dry-run) and the switch buttons on `/admin` are disabled; if unset, `/admin` manages it (default Dry-run). See section 5 |
+| `ARGUS_PORT` | Default 3000; the host-side port |
+| `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` | Optional; if set, Argus does not enter `/setup` setup mode |
+| `ARGUS_OWNER` | Optional; a GitLab user ID or username. Takes effect only when there is no owner yet |
+| `REVIEW_CONCURRENCY` | Optional, default `3`. Maximum number of reviews running at once across the whole site (each review is one `claude` process). One user's reviews always run in sequence; only different users run in parallel. Must be an integer >= 1; any other value is treated as 3 |
 
-資料存在三個 Docker volume（名稱前綴為 compose 專案名，預設是目錄名，例如 `argus-gitlab-review_argus-data`）：`argus-data`（資料庫、skill、各使用者加密後的 Claude token、各使用者獨立的 Claude 設定目錄 `engines/<GitLab 使用者 ID>/claude` 與 clone `clones/u<GitLab 使用者 ID>/`）、`claude-home`（owner 的容器 claude 登入）、`codex-home`。
+Data is stored in three Docker volumes (names are prefixed with the compose project name, which defaults to the directory name, e.g. `argus-gitlab-review_argus-data`): `argus-data` (database, skills, each user's encrypted Claude token, each user's separate Claude config directory `engines/<GitLab user ID>/claude`, and clones in `clones/u<GitLab user ID>/`), `claude-home` (the owner's container claude login), and `codex-home`.
 
-**備份**：至少備份 `.env`（尤其是主金鑰）與 `argus-data` volume。
+**Backup**: back up at least `.env` (especially the master key) and the `argus-data` volume.
 
-**停用服務**：`docker compose down` 只移除容器，volume 與 `.env` 保留，再 `up -d` 即還原。
+**Stopping the service**: `docker compose down` only removes the container; volumes and `.env` are kept, and `up -d` again restores it.
 
-**完全清除**（不可復原）：
+**Complete removal** (irreversible):
 
 ```sh
 docker compose down -v
 ```
 
-重新部署時若主金鑰遺失或不同，資料庫內已存的 token 無法解密：請把原本的 `ARGUS_MASTER_KEY` 填回 `.env`。
+If you redeploy with a lost or different master key, tokens already stored in the database cannot be decrypted: put the original `ARGUS_MASTER_KEY` back in `.env`.
 
-## 8. 訂閱與審查引擎
+## 8. Subscriptions and review engines
 
-每位使用者的審查跑在**自己的** Claude 訂閱上。規則只有一條，寫在程式一處（`src/engine.ts` 的 `chooseEngine`）：
+Each user's reviews run on **their own** Claude subscription. There is a single rule, implemented in one place (`chooseEngine` in `src/engine.ts`):
 
-| 使用者 | 有個人 Claude token | 沒有個人 Claude token |
+| User | Has a personal Claude token | No personal Claude token |
 |---|---|---|
-| owner | 用個人 token | 用容器內的 `claude` 登入（第 4 節） |
-| 測試白名單（`OWNER_ENGINE_TEST_USERS`） | 用個人 token | 借用 owner 的容器登入（測試例外） |
-| 其他使用者 | 用個人 token | **不審查**，審查紀錄記為「略過（尚未設定 Claude token）」。絕不改用 owner 的訂閱 |
+| owner | Uses the personal token | Uses the container's `claude` login (section 4) |
+| Test allowlist (`OWNER_ENGINE_TEST_USERS`) | Uses the personal token | Borrows the owner's container login (test exception) |
+| Other users | Uses the personal token | **Not reviewed**; recorded in Review history as "Skipped (Claude token not set yet)" (「略過（尚未設定 Claude token）」). The owner's subscription is never used |
 
-- 個人 token 被 Claude 拒絕（撤銷或過期）時標為「失效」，之後該使用者的審查記為「略過」，直到他貼上新的 token；owner 也一樣，不會自動退回容器登入（要回到容器登入，刪除個人 token 即可）。
-- Token 以 `ARGUS_MASTER_KEY` 加密存在資料庫。**owner 技術上可以用主密鑰解出所有人的 token**，請妥善保管主密鑰與主機管理權限。
-- 測試白名單：`.env` 加 `OWNER_ENGINE_TEST_USERS=bob,carol`（GitLab 帳號，逗號分隔）讓沒有個人 token 的他們借用 owner 的引擎；啟動時會印 `TEST MODE` 警告，不可用於正式環境。
-- `codex-cli` 引擎維持實驗狀態，只限 owner 與測試白名單，不會使用個人 Claude token（部分 Docker 環境無法使用，見第 9 節）。
+- When Claude rejects a personal token (revoked or expired), it is marked "invalid" (「失效」), and that user's later reviews are recorded as "skipped" until they paste a new token. The same applies to the owner: there is no automatic fallback to the container login (to go back to the container login, delete the personal token).
+- Tokens are encrypted with `ARGUS_MASTER_KEY` in the database. **The owner can technically decrypt everyone's tokens with the master key**, so protect the master key and host admin access.
+- Test allowlist: add `OWNER_ENGINE_TEST_USERS=bob,carol` (GitLab usernames, comma-separated) to `.env` to let those users borrow the owner's engine when they have no personal token. A `TEST MODE` warning is printed at startup; do not use it in production.
+- The `codex-cli` engine remains experimental, is limited to the owner and the test allowlist, and never uses personal Claude tokens (it does not work in some Docker environments; see section 9).
 
-並行：同一位使用者的審查與 `/argus accept` 處理依序執行；用個人 token 的使用者彼此並行，全站上限由 `REVIEW_CONCURRENCY`（第 7 節）控制。使用 owner 共用登入的審查（owner 沒貼 token 時、測試白名單、codex-cli）一律排在同一條序列，不會同時執行，避免共用登入被並行刷新而失效。
+Concurrency: one user's reviews and `/argus accept` handling run in sequence; users with personal tokens run in parallel with each other, and the site-wide cap is set by `REVIEW_CONCURRENCY` (section 7). Reviews that use the owner's shared login (the owner without a token, the test allowlist, codex-cli) all go in one queue and never run at the same time, so the shared login is not refreshed concurrently and invalidated.
 
-## 9. 疑難排解
+## 9. Troubleshooting
 
-| 現象 | 原因與處理 |
+| Symptom | Cause and fix |
 |---|---|
-| `docker compose` 報 `set BASE_URL ...` 或 `set GITLAB_URL ...` | `.env` 缺必填值，見第 7 節 |
-| 容器啟動後立刻結束，日誌顯示 `GITLAB_URL is required` 或 `no master key` | 補上 `GITLAB_URL` 或 `ARGUS_MASTER_KEY` 後 `docker compose up -d` |
-| GitLab 顯示 "The redirect URI included is not valid" | 該網址不在**同一個** OAuth Application 的 Redirect URI 清單，或結尾多了 `/`。須與 `BASE_URL` + `/auth/callback` 完全一致 |
-| 登入後停在「等待核准」，頁面提示尚未設定 owner | 沒有 owner：到 `/setup` 設定 owner（先執行 `setup reset`，見第 6 節），或在 `.env` 加 `ARGUS_OWNER=<GitLab 使用者 ID>` 後 `docker compose up -d`，再用該帳號重新登入即升為 owner |
-| `/setup` 顯示「嘗試次數過多」 | 同一來源 IP 累計 5 次錯誤 Setup code 後鎖 10 分鐘。等待，或 `docker compose restart` 重置 |
-| 找不到 Setup code | `docker compose exec argus cat /data/setup-code`；已設定完成則不會有 |
-| `/admin` 顯示「未登入」 | 照第 4 節登入後按「重新檢查登入狀態」 |
-| 測試連線失敗 | 看卡片上的錯誤訊息；多半是未登入或訂閱額度問題 |
-| 容器連不到 GitLab／Jira（名稱解析失敗） | 沒有 DNS 時，在 `docker-compose.yml` 啟用 `extra_hosts` 區塊 |
-| 日誌出現 bwrap／namespace 錯誤 | 部分 Docker 環境（預設 seccomp 或停用 user namespace）無法執行 codex 的沙盒，此時**不要使用 codex-cli**，維持 `claude-cli`；絕不要改用 `danger-full-access` |
-| 使用者看到「GitLab 授權已失效」 | 該使用者重新登入即可 |
-| 使用者的審查都是「略過（未設定 token）」 | 正常行為：請他在「設定」貼上自己的 Claude token（USER-GUIDE 第 2 節）。owner 不需要也不應該替他處理 |
-| `/admin` 某人的 Claude token 顯示「失效」 | 他的 token 已被撤銷或過期，請他重新執行 `claude setup-token` 並在設定頁取代 |
-| 審查沒有發佈留言 | 到 `/admin` 看「審查發佈模式」：Dry-run 就是只記錄不發；若顯示「.env 鎖定」，要先清除 `.env` 的 `DRY_RUN`，見第 5 節 |
+| `docker compose` reports `set BASE_URL ...` or `set GITLAB_URL ...` | A required value is missing from `.env`; see section 7 |
+| The container exits right after starting, and the log shows `GITLAB_URL is required` or `no master key` | Add `GITLAB_URL` or `ARGUS_MASTER_KEY`, then `docker compose up -d` |
+| GitLab shows "The redirect URI included is not valid" | The URL is not in the Redirect URI list of the **same** OAuth Application, or has an extra trailing `/`. It must match `BASE_URL` + `/auth/callback` exactly |
+| After login, stuck on "Awaiting approval" (「等待核准」) and the page says no owner is set | There is no owner: set one on `/setup` (run `setup reset` first, see section 6), or add `ARGUS_OWNER=<GitLab user ID>` to `.env` and `docker compose up -d`, then log in again with that account to be promoted to owner |
+| `/setup` shows "Too many attempts" (「嘗試次數過多」) | After 5 wrong Setup codes from the same source IP, it locks for 10 minutes. Wait, or `docker compose restart` to reset |
+| Cannot find the Setup code | `docker compose exec argus cat /data/setup-code`; there is none once setup is complete |
+| `/admin` shows "Not logged in" (「未登入」) | Log in as in section 4, then click **Re-check login status** (「重新檢查登入狀態」) |
+| Test connection fails | Read the error message on the card; usually not logged in, or a subscription quota problem |
+| The container cannot reach GitLab/Jira (name resolution fails) | If there is no DNS, enable the `extra_hosts` block in `docker-compose.yml` |
+| The log shows bwrap / namespace errors | Some Docker environments (default seccomp, or user namespaces disabled) cannot run codex's sandbox. In that case **do not use codex-cli**; stay on `claude-cli`; never switch to `danger-full-access` |
+| A user sees "GitLab authorization expired" (「GitLab 授權已失效」) | That user just logs in again |
+| A user's reviews are all "Skipped (token not set)" (「略過（未設定 token）」) | Expected: ask them to paste their own Claude token under Settings (USER-GUIDE section 2). The owner does not need to, and should not, handle it for them |
+| A user's Claude token shows "invalid" (「失效」) on `/admin` | Their token was revoked or expired; ask them to run `claude setup-token` again and replace it on the Settings page |
+| Reviews are not publishing comments | Check the "Review publish mode" card on `/admin`: Dry-run means record only, nothing is posted; if it shows "locked by `.env`" (「.env 鎖定」), clear `DRY_RUN` in `.env` first, see section 5 |

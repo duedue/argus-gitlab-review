@@ -148,7 +148,7 @@ openssl rand -base64 32          <span class="c"># put the output in ARGUS_MASTE
 $EDITOR .env                     <span class="c"># set BASE_URL, GITLAB_URL, ARGUS_MASTER_KEY</span>
 docker compose up -d --build</code></pre>
       <p class="after">Then open <code>BASE_URL</code>. The first run lands on <code>/setup</code>, which asks for the one-time setup code from the container log, your GitLab OAuth application credentials and the owner's GitLab user id. After that, sign in with GitLab, upload a skill and paste your Claude token. Switch from dry-run to live on the admin page when the results look right.</p>
-      <p class="after">Full walkthrough: <a href="https://github.com/duedue/argus-gitlab-review/blob/main/docs/SETUP.md">docs/SETUP.md</a> (Traditional Chinese) and the <a href="https://github.com/duedue/argus-gitlab-review#readme">README</a>.</p>
+      <p class="after">Full walkthrough: <a href="https://github.com/duedue/argus-gitlab-review/blob/main/docs/SETUP.md">docs/SETUP.md</a> and the <a href="https://github.com/duedue/argus-gitlab-review#readme">README</a>.</p>
     </div>
   </section>
 
@@ -159,7 +159,7 @@ docker compose up -d --build</code></pre>
         <li><strong>Claude subscription.</strong> Each user needs their own. Without a token, that user's reviews are skipped, and Argus never falls back to the owner's subscription.</li>
         <li><strong>GitLab OAuth application.</strong> Confidential, with scopes <code>api</code> and <code>read_repository</code>. Tested with GitLab 15.11.</li>
         <li><strong>Jira is optional, and Server / Data Center only.</strong> Jira Cloud is not supported.</li>
-        <li><strong>The web interface and the in-depth guides are in Traditional Chinese.</strong> This site and the README are the English entry points. Review comment language is a per-user setting.</li>
+        <li><strong>The web interface is in Traditional Chinese.</strong> This site, the README and the guides in <code>docs/</code> are in English. Review comment language is a per-user setting.</li>
         <li><strong>Polling, not webhooks.</strong> Reviews start within about 30 seconds, or instantly through the trigger API.</li>
         <li><strong>Large diffs are not reviewed.</strong> Argus asks the author to split the merge request instead. Draft merge requests are skipped.</li>
       </ul>

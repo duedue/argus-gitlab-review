@@ -6,7 +6,7 @@
 
 Argus is a self-hosted GitLab merge-request reviewer. It polls GitLab for open MRs where **you** are a reviewer, reviews them with an AI coding agent (`claude -p`, read-only, in a shallow clone) using **your own review skill**, and posts the findings as inline discussions plus a summary comment under your GitLab identity. Several people can share one Argus: each user brings their own GitLab login, skill, thresholds and Claude subscription.
 
-The in-app UI and the detailed guides in `docs/` are written in Traditional Chinese; this README is the English entry point.
+The in-app UI is in Traditional Chinese; this README and the guides in `docs/` are in English.
 
 ## Features
 
@@ -40,7 +40,7 @@ $EDITOR .env                     # set BASE_URL, GITLAB_URL, ARGUS_MASTER_KEY
 docker compose up -d --build
 ```
 
-Then open `BASE_URL`. A first run lands on `/setup`: it needs the one-time **setup code** printed in the container log (`docker compose logs argus | grep "Setup code"`, or `docker compose exec argus cat /data/setup-code`), your GitLab OAuth application credentials and the owner's GitLab user id. Afterwards log in with GitLab, log the container's `claude` in once (`docker compose exec argus claude`, then `/login`), upload a skill under Settings, and switch the publish mode from dry-run to live on `/admin` when the results look right. Step-by-step guide (Traditional Chinese): [docs/SETUP.md](docs/SETUP.md).
+Then open `BASE_URL`. A first run lands on `/setup`: it needs the one-time **setup code** printed in the container log (`docker compose logs argus | grep "Setup code"`, or `docker compose exec argus cat /data/setup-code`), your GitLab OAuth application credentials and the owner's GitLab user id. Afterwards log in with GitLab, log the container's `claude` in once (`docker compose exec argus claude`, then `/login`), upload a skill under Settings, and switch the publish mode from dry-run to live on `/admin` when the results look right. Step-by-step guide: [docs/SETUP.md](docs/SETUP.md).
 
 Useful commands (run in the compose directory):
 
@@ -211,7 +211,7 @@ Caveats for the experimental `codex-cli` engine:
 
 - **Jira Server / Data Center only** (Bearer token, REST v2). Jira Cloud is not supported.
 - Tested against **GitLab 15.11** only.
-- The web UI, the review summary labels and the guides under `docs/` are in **Traditional Chinese**. Review finding language is configurable per user (`zh-TW` by default).
+- The web UI and the review summary labels are in **Traditional Chinese**; the guides under `docs/` are in English. Review finding language is configurable per user (`zh-TW` by default).
 - The `codex-cli` engine is experimental and not available in every Docker environment.
 - Single-instance design (one process owns the poller, queue and SQLite file).
 
