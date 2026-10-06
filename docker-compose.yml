@@ -1,0 +1,31 @@
+# Argus: GitLab MR auto-review. Copy .env.example to .env, fill it in, then: docker compose up -d --build
+# Secrets live in ./.env (chmod 0600, never committed).
+services:
+  argus:
+    build: .
+    image: argus:local
+    container_name: argus
+    restart: unless-stopped
+    # ARGUS_MASTER_KEY and the optional OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET / JIRA_API_TOKEN / DRY_RUN / ARGUS_OWNER / ... come from here
+    env_file: ./.env
+    environment:
+      HOST: 0.0.0.0
+      ARGUS_DEPLOY: compose # operator commands shown in the UI use `docker compose exec` (explicit, not inferred)
+      PORT: "3000"
+      BASE_URL: ${BASE_URL:?set BASE_URL to the public URL (must match the GitLab OAuth redirect URI)}
+      GITLAB_URL: ${GITLAB_URL:?set GITLAB_URL to your GitLab base URL, e.g. https://gitlab.example.com}
+    ports:
+      - "${ARGUS_PORT:-3000}:3000"
+    volumes:
+      - argus-data:/data # DATA_DIR: sqlite db, clone cache, uploaded skills, isolated codex-home
+      - claude-home:/home/node/.claude # CLAUDE_CONFIG_DIR (set in the Dockerfile): all Claude state incl. .claude.json; log in with `docker compose exec argus claude` then /login
+      - codex-home:/home/node/.codex # CODEX_HOME (set in the Dockerfile): codex login (experimental engine), `docker compose exec argus codex login --device-auth`
+    # If the container cannot resolve your GitLab/Jira host names (no DNS), uncomment and adjust:
+    # extra_hosts:
+    #   - "gitlab.example.com:192.0.2.10"
+    #   - "jira.example.com:192.0.2.11"
+
+volumes:
+  argus-data:
+  claude-home:
+  codex-home:

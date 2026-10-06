@@ -1,0 +1,33 @@
+{
+  "name": "argus-gitlab-review",
+  "version": "0.2.6",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "type": "module",
+  "description": "GitLab MR auto-review: poll reviewer assignments, review with claude -p, post findings",
+  "scripts": {
+    "cli": "tsx src/cli.ts",
+    "poll-once": "tsx src/cli.ts once",
+    "dev": "tsx src/cli.ts loop",
+    "web": "tsx src/web/server.ts",
+    "test": "node --import tsx --test test/*.test.ts test/*.test.tsx",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.19.17",
+    "better-sqlite3": "^11.10.0",
+    "hono": "^4.13.12",
+    "marked": "^16.4.2",
+    "minimatch": "^10.2.6",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
