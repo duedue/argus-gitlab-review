@@ -1,0 +1,135 @@
+# Publishes the next prepared release every Monday 09:00 Asia/Taipei (01:00 UTC).
+# A release is prepared as a branch named release/<version> whose last commit bumps
+# package.json and adds .changes/<version>.md (the release notes). CHANGELOG.md is
+# written by this workflow only. See docs/RELEASING.md.
+name: Publish release
+
+on:
+  schedule:
+    - cron: "0 1 * * 1"
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "release/<version> branch to publish (default: the lowest pending version)"
+        required: false
+        type: string
+
+concurrency: publish
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PUBLISH_PAT }}
+
+      - name: Pick the release branch
+        id: pick
+        env:
+          REQUESTED: ${{ inputs.branch }}
+        run: |
+          set -eu
+          if [ -n "$REQUESTED" ]; then
+            branch="$REQUESTED"
+          else
+            branch=$(git for-each-ref --format='%(refname:short)' 'refs/remotes/origin/release/*' \
+              | sed 's#^origin/##' | sort -t/ -k2,2V | head -n 1)
+          fi
+          if [ -z "$branch" ]; then
+            echo "No release/* branch pending; nothing to publish."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git rev-parse --verify "origin/$branch" >/dev/null
+          version="${branch#release/}"
+          current=$(node -p "require('./package.json').version")
+          newest=$(printf '%s\n%s\n' "$current" "$version" | sort -V | tail -n 1)
+          if [ "$newest" != "$version" ] || [ "$current" = "$version" ]; then
+            echo "::error::$branch ($version) is not newer than main ($current)"
+            exit 1
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Rebase onto main with publish-time dates and write the changelog
+        if: steps.pick.outputs.skip == 'false'
+        env:
+          BRANCH: ${{ steps.pick.outputs.branch }}
+          VERSION: ${{ steps.pick.outputs.version }}
+        run: |
+          set -eu
+          git config user.name "Michael Tsai"
+          git config user.email "duedue.tsai@gmail.com"
+          git checkout -B publish "origin/$BRANCH"
+          git rebase --reset-author-date origin/main
+          test "$(node -p "require('./package.json').version")" = "$VERSION" \
+            || { echo "::error::package.json version does not match $BRANCH"; exit 1; }
+          test -s ".changes/$VERSION.md" \
+            || { echo "::error::.changes/$VERSION.md is missing or empty"; exit 1; }
+          { printf '## [%s] - %s\n\n' "$VERSION" "$(date -u +%F)"; cat ".changes/$VERSION.md"; echo; } > section.md
+          awk -v f=section.md '
+            /^## \[/ && !done { while ((getline l < f) > 0) print l; done = 1 }
+            { print }
+            END { if (!done) { while ((getline l < f) > 0) print l } }
+          ' CHANGELOG.md > CHANGELOG.new
+          mv CHANGELOG.new CHANGELOG.md
+          rm section.md
+          git add CHANGELOG.md
+          git commit -m "docs(changelog): $VERSION"
+
+      - uses: actions/setup-node@v4
+        if: steps.pick.outputs.skip == 'false'
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Test
+        if: steps.pick.outputs.skip == 'false'
+        run: |
+          npm ci
+          npm run typecheck
+          npm test
+
+      - name: Build the image
+        if: steps.pick.outputs.skip == 'false'
+        env:
+          VERSION: ${{ steps.pick.outputs.version }}
+        run: |
+          docker build -t "ghcr.io/${{ github.repository }}:$VERSION" -t "ghcr.io/${{ github.repository }}:latest" .
+
+      - name: Fast-forward main, tag, drop the release branch
+        if: steps.pick.outputs.skip == 'false'
+        env:
+          BRANCH: ${{ steps.pick.outputs.branch }}
+          VERSION: ${{ steps.pick.outputs.version }}
+        run: |
+          set -eu
+          git push origin publish:main
+          git tag -a "v$VERSION" -m "Argus $VERSION"
+          git push origin "v$VERSION"
+          git push origin --delete "$BRANCH"
+
+      - name: Create the GitHub release
+        if: steps.pick.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.PUBLISH_PAT }}
+          VERSION: ${{ steps.pick.outputs.version }}
+        run: gh release create "v$VERSION" --title "Argus $VERSION" --notes-file ".changes/$VERSION.md"
+
+      - uses: docker/login-action@v3
+        if: steps.pick.outputs.skip == 'false'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push the image
+        if: steps.pick.outputs.skip == 'false'
+        run: docker push --all-tags "ghcr.io/${{ github.repository }}"

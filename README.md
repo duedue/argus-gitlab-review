@@ -2,7 +2,9 @@
 
 <img src="docs/images/argus-icon.png" alt="Argus logo" width="72" align="right">
 
-**Website: <https://duedue.github.io/argus-gitlab-review/>** ([繁體中文](https://duedue.github.io/argus-gitlab-review/zh-TW/))
+[![CI](https://github.com/duedue/argus-gitlab-review/actions/workflows/ci.yml/badge.svg)](https://github.com/duedue/argus-gitlab-review/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/duedue/argus-gitlab-review)](https://github.com/duedue/argus-gitlab-review/releases)
+
+**Website: <https://duedue.github.io/argus-gitlab-review/>** ([繁體中文](https://duedue.github.io/argus-gitlab-review/zh-TW/)) · [Changelog](CHANGELOG.md)
 
 Argus is a self-hosted GitLab merge-request reviewer. It polls GitLab for open MRs where **you** are a reviewer, reviews them with an AI coding agent (`claude -p`, read-only, in a shallow clone) using **your own review skill**, and posts the findings as inline discussions plus a summary comment under your GitLab identity. Several people can share one Argus: each user brings their own GitLab login, skill, thresholds and Claude subscription.
 
@@ -239,6 +241,8 @@ npm run cli -- review <project_id> <mr_iid> [--user <username>] [--head <sha>] [
 ```
 
 `user add` checks the PAT via `GET /user` and `/personal_access_tokens/self` (needs `api` scope, not expired) and stores it AES-256-GCM encrypted. Master key: Keychain item `argus`/`master-key`, fallback env `ARGUS_MASTER_KEY`; no key = refuse to run.
+
+Releases are cut from `release/<version>` branches by a scheduled workflow; see [docs/RELEASING.md](docs/RELEASING.md).
 
 ## License
 
