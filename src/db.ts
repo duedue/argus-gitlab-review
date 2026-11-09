@@ -45,14 +45,29 @@ export function openDb(path: string): Db {
       token_invalid INTEGER NOT NULL DEFAULT 0, -- refresh was rejected: user must log in again
       approved INTEGER NOT NULL DEFAULT 1       -- web sign-ups start at 0 (pending); CLI-added users are approved
     );
-    -- Projects the poller skipped for a user (not on their allowlist): feeds the settings page quick-add. Never read by the review path.
-    CREATE TABLE IF NOT EXISTS seen_projects (
+    -- MRs the poller skipped for a user (project not allowed): the "pending decision" block on /reviews. Replaced wholesale each successful poll. Never read by the review path.
+    CREATE TABLE IF NOT EXISTS seen_mrs (
       gitlab_user_id INTEGER NOT NULL,
-      project_path TEXT NOT NULL,
-      last_mr_url TEXT NOT NULL,
+      mr_id INTEGER NOT NULL,
+      project_id INTEGER NOT NULL,
+      mr_iid INTEGER NOT NULL,
+      project_path TEXT NOT NULL,               -- lowercased
+      title TEXT NOT NULL,
+      web_url TEXT NOT NULL,
+      author TEXT,
       last_seen_at TEXT NOT NULL,               -- UTC "YYYY-MM-DD HH:MM:SS"
-      PRIMARY KEY (gitlab_user_id, project_path)
+      PRIMARY KEY (gitlab_user_id, mr_id)
     );
+    -- Single MRs a user allowed with one click ("review only this one"); read by reviewAllowed(). Rows are tiny, never cleaned up.
+    CREATE TABLE IF NOT EXISTS allowed_mrs (
+      gitlab_user_id INTEGER NOT NULL,
+      mr_id INTEGER NOT NULL,
+      project_id INTEGER NOT NULL,
+      mr_iid INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (gitlab_user_id, mr_id)
+    );
+    DROP TABLE IF EXISTS seen_projects;       -- superseded by seen_mrs (0.3.x only; held nothing the review path needed)
     CREATE TABLE IF NOT EXISTS sessions (
       id_hash TEXT PRIMARY KEY,                 -- sha256 of the cookie value
       user_id INTEGER NOT NULL,
@@ -283,22 +298,35 @@ export function resetFailed(db: Db, id: number, ownerId: number): boolean {
   return db.prepare(`DELETE FROM reviews WHERE id=? AND owner_id=? AND status='failed'`).run(id, ownerId).changes === 1;
 }
 
-export const SEEN_PROJECT_DAYS = 30;
+export interface SeenMr { mrId: number; projectId: number; mrIid: number; path: string; title: string; url: string; author: string | null; lastSeenAt: string }
 
-/** Upsert one skipped project for a user (poll only) and prune that user's rows older than the window. */
-export function recordSeenProject(db: Db, userId: number, path: string, mrUrl: string): void {
-  db.prepare(
-    `INSERT INTO seen_projects (gitlab_user_id, project_path, last_mr_url, last_seen_at) VALUES (?, ?, ?, datetime('now'))
-     ON CONFLICT(gitlab_user_id, project_path) DO UPDATE SET last_mr_url=excluded.last_mr_url, last_seen_at=excluded.last_seen_at`,
-  ).run(userId, path.toLowerCase(), mrUrl);
-  db.prepare(`DELETE FROM seen_projects WHERE gitlab_user_id=? AND last_seen_at < datetime('now', ?)`).run(userId, `-${SEEN_PROJECT_DAYS} days`);
+/** Replace the user's pending-decision MRs with this poll's skipped set (call only after a successful list). */
+export function replaceSeenMrs(db: Db, userId: number, rows: Omit<SeenMr, "lastSeenAt">[]): void {
+  db.transaction(() => {
+    db.prepare(`DELETE FROM seen_mrs WHERE gitlab_user_id=?`).run(userId);
+    const ins = db.prepare(`INSERT OR REPLACE INTO seen_mrs (gitlab_user_id, mr_id, project_id, mr_iid, project_path, title, web_url, author, last_seen_at) VALUES (?,?,?,?,?,?,?,?,datetime('now'))`);
+    for (const r of rows) ins.run(userId, r.mrId, r.projectId, r.mrIid, r.path.toLowerCase(), r.title, r.url, r.author);
+  })();
 }
 
-/** Projects skipped for this user within the window, most recent first. */
-export const listSeenProjects = (db: Db, userId: number): { path: string; url: string; lastSeenAt: string }[] =>
-  (db.prepare(`SELECT project_path, last_mr_url, last_seen_at FROM seen_projects WHERE gitlab_user_id=? AND last_seen_at >= datetime('now', ?) ORDER BY last_seen_at DESC, project_path`)
-    .all(userId, `-${SEEN_PROJECT_DAYS} days`) as { project_path: string; last_mr_url: string; last_seen_at: string }[])
-    .map((r) => ({ path: r.project_path, url: r.last_mr_url, lastSeenAt: r.last_seen_at }));
+const toSeen = (r: Record<string, unknown>): SeenMr => ({ mrId: r.mr_id as number, projectId: r.project_id as number, mrIid: r.mr_iid as number, path: r.project_path as string, title: r.title as string, url: r.web_url as string, author: (r.author as string | null) ?? null, lastSeenAt: r.last_seen_at as string });
+
+export const listSeenMrs = (db: Db, userId: number): SeenMr[] =>
+  (db.prepare(`SELECT * FROM seen_mrs WHERE gitlab_user_id=? ORDER BY last_seen_at DESC, project_path, mr_iid`).all(userId) as Record<string, unknown>[]).map(toSeen);
+
+export const getSeenMr = (db: Db, userId: number, mrId: number): SeenMr | undefined => {
+  const r = db.prepare(`SELECT * FROM seen_mrs WHERE gitlab_user_id=? AND mr_id=?`).get(userId, mrId) as Record<string, unknown> | undefined;
+  return r && toSeen(r);
+};
+
+export const deleteSeenMr = (db: Db, userId: number, mrId: number): void => void db.prepare(`DELETE FROM seen_mrs WHERE gitlab_user_id=? AND mr_id=?`).run(userId, mrId);
+
+/** "Review only this MR": allowed on every later push until it closes. */
+export const allowMr = (db: Db, userId: number, m: { mrId: number; projectId: number; mrIid: number }): void =>
+  void db.prepare(`INSERT OR IGNORE INTO allowed_mrs (gitlab_user_id, mr_id, project_id, mr_iid) VALUES (?,?,?,?)`).run(userId, m.mrId, m.projectId, m.mrIid);
+
+export const isMrAllowed = (db: Db, userId: number, mrId: number): boolean =>
+  !!db.prepare(`SELECT 1 FROM allowed_mrs WHERE gitlab_user_id=? AND mr_id=?`).get(userId, mrId);
 
 /** True when the head is claimed and not re-claimable (a due automatic retry or a no-engine skip may be claimed again). */
 export function reviewExists(db: Db, ownerId: number, mrId: number, headSha: string, dryRun: boolean, now = Date.now()): boolean {

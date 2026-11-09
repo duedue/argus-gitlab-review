@@ -5,7 +5,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
-import { listSeenProjects, openDb, recordSeenProject } from "../src/db.ts";
+import { listSeenMrs, openDb } from "../src/db.ts";
 import type { GitLab, MrSummary } from "../src/gitlab.ts";
 import { parseProjectList, projectAllowed } from "../src/projects.ts";
 import { ReviewQueue } from "../src/queue.ts";
@@ -99,9 +99,9 @@ test("poll: only allowlisted projects reach the engine, one summary log line, em
   assert.deepEqual(r.reviewed, [1]);
   assert.equal(r.logs.filter((l) => l.includes("skipped (not in project list)")).length, 1);
   assert.ok(r.logs.some((l) => l.includes("3 skipped (not in project list)")));
-  assert.deepEqual(listSeenProjects(r.db, 1).map((x) => x.path).sort(), ["grp/ab/y", "other/z"], "skipped projects recorded (unparseable url is not)");
+  assert.deepEqual(listSeenMrs(r.db, 1).map((x) => x.path).sort(), ["grp/ab/y", "other/z"], "skipped MRs recorded (unparseable url is not)");
   assert.equal((r.db.prepare(`SELECT COUNT(*) n FROM reviews`).get() as { n: number }).n, 1, "no reviews rows for skipped MRs");
-  assert.deepEqual(listSeenProjects((await run("", true)).db, 1), [], "allowAll records nothing");
+  assert.deepEqual(listSeenMrs((await run("", true)).db, 1), [], "allowAll records nothing");
   assert.deepEqual((await run("")).reviewed, [], "strict: empty list reviews nothing");
   assert.deepEqual((await run("", true)).reviewed, [1, 2, 3, 4], "allowAll = no filtering");
 });
@@ -133,21 +133,6 @@ test("trigger: non-self reviewer outside the list is skipped; self-review is not
   } finally {
     console.log = log;
   }
-});
-
-test("seen_projects: upsert updates url and time, 30-day window hides and prunes old rows", () => {
-  const db = openDb(":memory:");
-  recordSeenProject(db, 1, "Grp/A", `${GL}/Grp/A/-/merge_requests/1`);
-  recordSeenProject(db, 1, "grp/a", `${GL}/grp/a/-/merge_requests/2`);
-  recordSeenProject(db, 2, "grp/a", `${GL}/grp/a/-/merge_requests/9`);
-  assert.deepEqual(listSeenProjects(db, 1).map((x) => [x.path, x.url]), [["grp/a", `${GL}/grp/a/-/merge_requests/2`]]);
-  db.prepare(`UPDATE seen_projects SET last_seen_at=datetime('now','-31 days') WHERE gitlab_user_id=1`).run();
-  assert.deepEqual(listSeenProjects(db, 1), [], "older than 30 days is hidden");
-  db.prepare(`UPDATE seen_projects SET last_seen_at=datetime('now','-29 days') WHERE gitlab_user_id=1`).run();
-  assert.equal(listSeenProjects(db, 1).length, 1);
-  db.prepare(`UPDATE seen_projects SET last_seen_at=datetime('now','-31 days') WHERE gitlab_user_id=1`).run();
-  recordSeenProject(db, 1, "grp/b", `${GL}/grp/b/-/merge_requests/3`);
-  assert.equal((db.prepare(`SELECT COUNT(*) n FROM seen_projects WHERE gitlab_user_id=1`).get() as { n: number }).n, 1, "a write prunes the user's rows older than 30 days");
 });
 
 test("migration: existing users get review_all_projects=1 once, new sign-ups and later opens stay as they are", () => {

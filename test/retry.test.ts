@@ -5,7 +5,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
-import { claimReview, failReview, openDb, releaseStaleRunning, reviewExists, type Db } from "../src/db.ts";
+import { allowMr, claimReview, failReview, openDb, releaseStaleRunning, reviewExists, type Db } from "../src/db.ts";
 import type { ReviewEngine } from "../src/engine.ts";
 import type { GitLab, Mr } from "../src/gitlab.ts";
 import { failureNote, sanitizeReason } from "../src/publisher.ts";
@@ -501,5 +501,17 @@ test("sweep: a non-self retry whose project left the allowlist is dropped (no ru
     await quiet(() => pollOnce({ ...s.cfg, gitlabUrl: GL }, s.db, [getUser(s.db, "alice")!], () => s.rt, s.queue));
     assert.equal(s.runs(), self ? 2 : 1, self ? "self-review unrestricted" : "dropped, not re-run");
     if (!self) assert.deepEqual({ st: row(s.db).status, n: row(s.db).next_retry_at }, { st: "failed", n: null });
+  }
+});
+
+test("sweep: a retry whose project left the allowlist survives when the MR was allowed singly or the user authored it", async () => {
+  for (const mode of ["allowed", "own"] as const) {
+    const s = sweepHarness(false, mode === "own" ? { author: { id: 1 } } : {});
+    await s.fail();
+    s.db.prepare(`UPDATE reviews SET next_retry_at=1`).run();
+    setUser(s.db, "alice", ["review_all_projects=0", "review_projects=other/proj"]);
+    if (mode === "allowed") allowMr(s.db, 1, { mrId: 700, projectId: 9, mrIid: 7 });
+    await quiet(() => pollOnce({ ...s.cfg, gitlabUrl: GL }, s.db, [getUser(s.db, "alice")!], () => s.rt, s.queue));
+    assert.equal(s.runs(), 2, `${mode}: retried`);
   }
 });

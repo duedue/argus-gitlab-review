@@ -6,7 +6,7 @@ import { bodyLimit } from "hono/body-limit";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import type { Config } from "../config.ts";
 import { API_KEY_RE, createApiKey, findApiKey, getApiKeyInfo, touchApiKey } from "../apikeys.ts";
-import { isSelfReview, lastModelUsed, listSeenProjects, resetFailed, type Db } from "../db.ts";
+import { allowMr, deleteSeenMr, getSeenMr, isSelfReview, lastModelUsed, listSeenMrs, resetFailed, type Db } from "../db.ts";
 import { operatorCommands } from "../commands.ts";
 import { claudeAuthStatus, claudeTestConnection, codexLoginStatus, ttlCache, type ConnectionTest } from "../engine-status.ts";
 import { exchangeCode, fetchIdentity, newAuthRequest, type OAuthCtx } from "../oauth.ts";
@@ -17,12 +17,13 @@ import { checkSetupCode, completeSetup, setDryRun, validateSetupInput } from "..
 import { createSession, deleteSession, getSession, safeEqual, SESSION_TTL_MS } from "../sessions.ts";
 import { MAX_SKILL_BYTES, managedSkillPath, saveSkill, scanSkill, validateSkillText } from "../skills.ts";
 import { bootstrapOwner, clearClaudeToken, engineFields, getUserById, hasOwner, listUsers, parseSettings, setClaudeToken, setUser, setUserEnabled, upsertOAuthUser, userStatus, validateClaudeToken, type User } from "../users.ts";
-import { projectAllowed } from "../projects.ts";
+import { parseProjectList, reviewAllowed } from "../projects.ts";
+import { isDraft } from "../gitlab.ts";
 import { chooseEngine, laneFor } from "../engine.ts";
 import { makeRateLimiter, parseMrUrl, TRIGGER_LIMIT_PER_HOUR, triggerReviews, TriggerError } from "../trigger.ts";
 import { DOCS, loadDocs, type DocKey } from "./docs.ts";
 import {
-  AdminPage, DocPage, LoginPage, MessagePage, PendingPage, render, ReviewsPage, SettingsPage, SetupPage, type LastReview, type ReviewRow, type SettingsView,
+  AdminPage, DocPage, LoginPage, MessagePage, PendingPage, render, ReviewsPage, SettingsPage, SetupPage, type LastReview, type Notice, type ReviewRow, type SettingsView,
 } from "./views.tsx";
 
 export interface WebDeps {
@@ -51,6 +52,21 @@ const STATE_COOKIE = "oauth_state";
 const VERIFIER_COOKIE = "oauth_verifier";
 const SESSION_COOKIE = "sid";
 
+/** Fixed flash texts for PRG redirects (`?notice=<code>`); the query only ever supplies a key, never text. */
+const NOTICES: Record<string, Notice> = {
+  queued: { text: "已允許，審查已排入佇列，完成後結果會出現在 MR 與審查紀錄。" },
+  already_queued: { text: "已允許；這張 MR 已在審查佇列中。" },
+  allowed_no_skill: { text: "已允許，但你目前尚未設定 skill 或帳號無法執行審查，補上後下一輪輪詢會自動審查。", warn: true },
+  allowed_no_engine: { text: "已允許，但目前沒有可用的審查引擎（請先設定 Claude token），之後下一輪輪詢會自動審查。", warn: true },
+  allowed_busy: { text: "已允許；操作太頻繁，未立即排入，下一輪輪詢會自動審查。", warn: true },
+  allowed_gitlab: { text: "已允許，但暫時無法從 GitLab 取得這張 MR，下一輪輪詢會自動審查。", warn: true },
+  allowed_closed: { text: "已允許；這張 MR 已不是 open 狀態，不需要審查。", warn: true },
+  allowed_draft: { text: "已記下；MR 轉為 ready 後會自動審查。", warn: true },
+  added: { text: "已新增，立即生效。" },
+  removed: { text: "已解除，立即生效。" },
+  not_found: { text: "清單中沒有這一項，未做任何變更。", warn: true },
+};
+
 export function createApp({
   cfg, db, key, oauth, runtimeFor = runtimeFactory(cfg, db, key, oauth), queue = reviewQueue, triggerLimitPerHour = TRIGGER_LIMIT_PER_HOUR, docsDir,
   verifyClaudeToken = (u, token) => claudeTestConnection(cfg.claudeBin, u.model, { token: () => token, configDir: claudeConfigDir(cfg.dataDir, u.gitlabUserId) }),
@@ -62,6 +78,7 @@ export function createApp({
   const codexStatus = ttlCache(60_000, () => codexLoginStatus(cfg.codexBin));
   const testAllowed = makeRateLimiter(1, 30_000);
   const retryAllowed = makeRateLimiter(1, 30_000); // manual re-review: 1 per 30s per user
+  const quickReviewAllowed = makeRateLimiter(10, 60_000); // one-click allow: at most 10 immediate reviews/min/user; the rest wait for the next poll
   const tokenVerifyAllowed = makeRateLimiter(1, 30_000); // saving a Claude token costs one model call: 1 per 30s per user
   const cookieOpts = { httpOnly: true, sameSite: "Lax", secure: cfg.web.cookieSecure, path: "/" } as const;
   const page = (c: Context, el: unknown, status: 200 | 400 | 403 | 404 | 413 | 429 = 200) => c.html(render(el), status);
@@ -241,12 +258,47 @@ export function createApp({
       apiKey: getApiKeyInfo(db, u.gitlabUserId), baseUrl: cfg.web.baseUrl, lastModel: lastModelUsed(db, u.gitlabUserId),
       warnings: own ? scanSkill(skillText) : [], maxSkillKb: MAX_SKILL_BYTES / 1024, defaultMaxDiffLines: cfg.maxDiffLines,
       engine: chooseEngine(engineFields(u), cfg.ownerEngineTestUsers),
-      seenProjects: u.reviewAllProjects ? [] : listSeenProjects(db, u.gitlabUserId).filter((s) => !projectAllowed(s.path, u.reviewProjects, false)),
       ...extra,
     };
   };
 
-  app.get("/settings", authed, (c) => page(c, <SettingsPage {...settingsView(c.get("user"), c.get("csrf"))} />));
+  app.get("/settings", authed, (c) => page(c, <SettingsPage {...settingsView(c.get("user"), c.get("csrf"), { notice: NOTICES[c.req.query("notice") ?? ""] })} />));
+
+  // Allowlist buttons: every path (add, remove, one-click allow-project) writes review_projects through this one function.
+  // Read-modify-write in one transaction on a fresh row, so two concurrent requests cannot overwrite each other's change.
+  // Returns whether the list changed; setUser (parseProjectList) validates and enforces the cap, a throw rolls back.
+  const writeProjects = (userId: number, change: (list: string[]) => string[]): boolean =>
+    db.transaction(() => {
+      const cur = getUserById(db, userId)!;
+      const next = [...new Set(change(cur.reviewProjects))];
+      if (next.length === cur.reviewProjects.length && next.every((e, i) => e === cur.reviewProjects[i])) return false;
+      setUser(db, cur.username, [`review_projects=${next.join("\n")}`]);
+      return true;
+    })();
+
+  app.post("/settings/projects/add", authed, csrf, async (c) => {
+    const u = c.get("user");
+    const raw = (await c.req.parseBody()).project;
+    try {
+      const add = parseProjectList(typeof raw === "string" ? raw : "");
+      if (!add.length) throw new Error("請輸入專案或 group 的完整路徑，例如 group/project");
+      writeProjects(u.gitlabUserId, (l) => [...l, ...add]);
+    } catch (e) {
+      return page(c, <SettingsPage {...settingsView(u, c.get("csrf"), { projectError: (e as Error).message, projectValue: typeof raw === "string" ? raw : "" })} />, 400);
+    }
+    return c.redirect("/settings?notice=added#review-projects");
+  });
+
+  app.post("/settings/projects/remove", authed, csrf, async (c) => {
+    const u = c.get("user");
+    const raw = (await c.req.parseBody()).project;
+    let drop: string | undefined;
+    try {
+      drop = parseProjectList(typeof raw === "string" ? raw : "")[0]; // same normalizer as add
+    } catch { /* not a valid path, so it cannot be in the list */ }
+    const changed = !!drop && writeProjects(u.gitlabUserId, (l) => l.filter((e) => e !== drop));
+    return c.redirect(`/settings?notice=${changed ? "removed" : "not_found"}#review-projects`);
+  });
 
   // Validate -> write skill (fixed path) -> update settings. Nothing is written when validation fails.
   const applySettings = (c: Context<Env>, pairs: string[], pastedText: string, skill?: () => Promise<string | undefined>) => {
@@ -272,7 +324,7 @@ export function createApp({
   app.post("/settings", tooLarge, authed, csrf, async (c) => {
     const body = await c.req.parseBody();
     const str = (k: string) => (typeof body[k] === "string" ? (body[k] as string) : "");
-    const pairs = [`severity_threshold=${str("severity_threshold")}`, `confidence_threshold=${str("confidence_threshold")}`, `language=${str("language").trim()}`, `auto_approve=${str("auto_approve") === "1" ? 1 : 0}`, `review_assigned=${str("review_assigned") === "1" ? 1 : 0}`, `max_diff_lines=${str("max_diff_lines").trim()}`, `review_projects=${str("review_projects").replace(/\r\n/g, "\n")}`, `review_all_projects=${str("review_all_projects") === "1" ? 1 : 0}`];
+    const pairs = [`severity_threshold=${str("severity_threshold")}`, `confidence_threshold=${str("confidence_threshold")}`, `language=${str("language").trim()}`, `auto_approve=${str("auto_approve") === "1" ? 1 : 0}`, `review_assigned=${str("review_assigned") === "1" ? 1 : 0}`, `max_diff_lines=${str("max_diff_lines").trim()}`, `review_all_projects=${str("review_all_projects") === "1" ? 1 : 0}`];
     // The select is disabled for codex-cli users (not submitted): an absent field keeps the stored value instead of clearing it.
     if (typeof body.model === "string") pairs.push(`model=${body.model}`);
     const pasted = str("skill_text").replace(/\r\n/g, "\n"); // browsers submit CRLF
@@ -381,7 +433,8 @@ export function createApp({
         round: (r.round as number | null) ?? null,
       };
     });
-    return page(c, <ReviewsPage user={u} csrf={c.get("csrf")} rows={rows} />);
+    const pending = u.reviewAllProjects ? [] : listSeenMrs(db, u.gitlabUserId).filter((m) => !reviewAllowed(db, u, m.path, m.mrId));
+    return page(c, <ReviewsPage user={u} csrf={c.get("csrf")} rows={rows} pending={pending} notice={NOTICES[c.req.query("notice") ?? ""]} />);
   });
 
   // Manual re-review of a failed row: resets attempts, releases the row and queues the MR's current head at once.
@@ -414,6 +467,44 @@ export function createApp({
     const { queued } = queue.enqueue(laneFor(engineFields(owner), cfg.ownerEngineTestUsers), queueKey(owner.gitlabUserId, mr.id, mr.sha), () => reviewMr(cfg, db, owner, rt, mr, undefined, { selfReview }));
     return msg("已加入審查佇列", queued ? "審查將立即開始，完成後結果會出現在 MR 與審查紀錄。" : "這個 MR 已在佇列中。");
   });
+
+  // One-click decisions on a skipped MR. The MR is looked up in the caller's own seen_mrs only (client-supplied project/iid are never trusted).
+  const decide = (scope: "mr" | "project") => async (c: Context<Env>) => {
+    const u = c.get("user");
+    const id = Number(c.req.param("mrId"));
+    const row = Number.isSafeInteger(id) ? getSeenMr(db, u.gitlabUserId, id) : undefined;
+    if (!row) return page(c, <MessagePage title="找不到" message="這張 MR 已不在待決定清單內（可能已處理、已關閉或已不再指派給你）。" user={u} csrf={c.get("csrf")} />, 404);
+    if (scope === "mr") allowMr(db, u.gitlabUserId, row);
+    else {
+      try {
+        writeProjects(u.gitlabUserId, (l) => [...l, row.path]);
+      } catch (e) {
+        return page(c, <MessagePage title="無法加入專案" message={(e as Error).message} user={u} csrf={c.get("csrf")} />, 400);
+      }
+      for (const m of listSeenMrs(db, u.gitlabUserId)) if (m.path === row.path || m.path.startsWith(`${row.path}/`)) deleteSeenMr(db, u.gitlabUserId, m.mrId); // others join the next poll
+    }
+    deleteSeenMr(db, u.gitlabUserId, id);
+    const done = (code: string) => c.redirect(`/reviews?notice=${code}`);
+    // Same enqueue as the manual retry. The decision is already stored, so every non-queued outcome is "allowed; the next poll reviews it".
+    if (!u.approved || !u.enabled || !u.skillPath) return done("allowed_no_skill");
+    let rt: UserRuntime, mr;
+    try {
+      rt = await runtimeFor(u);
+      mr = await rt.gl.getMr(row.projectId, row.mrIid);
+    } catch (e) {
+      console.error("[web] allow lookup failed:", (e as Error).message);
+      return done("allowed_gitlab");
+    }
+    if (mr.state !== "opened") return done("allowed_closed");
+    if (isDraft(mr)) return done("allowed_draft"); // like the poller: a draft is skipped until it is ready
+    if (!rt.engine) return done("allowed_no_engine");
+    // Counted only here: a lookup failure, closed/draft MR or missing engine must not use up the budget.
+    if (!quickReviewAllowed(String(u.gitlabUserId))) return done("allowed_busy");
+    const { queued } = queue.enqueue(laneFor(engineFields(u), cfg.ownerEngineTestUsers), queueKey(u.gitlabUserId, mr.id, mr.sha), () => reviewMr(cfg, db, u, rt, mr));
+    return done(queued ? "queued" : "already_queued");
+  };
+  app.post("/pending-mrs/:mrId/allow-mr", authed, csrf, decide("mr"));
+  app.post("/pending-mrs/:mrId/allow-project", authed, csrf, decide("project"));
 
   // --- admin (owner only) ---
   const adminPage = async (c: Context<Env>, extra: { test?: ConnectionTest; force?: boolean } = {}, status: 200 | 429 = 200) => {

@@ -5,7 +5,7 @@ import type { ApiKeyInfo } from "../apikeys.ts";
 import type { ClaudeAuth, CodexAuth, ConnectionTest } from "../engine-status.ts";
 import type { OperatorCommands } from "../commands.ts";
 import { CLAUDE_TOKEN_WARN_DAYS, claudeTokenDaysLeft, ENGINES, MAX_DIFF_LINES, MIN_DIFF_LINES, MODELS, userStatus, type User } from "../users.ts";
-import { SEEN_PROJECT_DAYS } from "../db.ts";
+import type { SeenMr } from "../db.ts";
 import { SKIP_REASONS, type EngineChoice } from "../engine.ts";
 
 const MODEL_LABEL: Record<string, string> = { opus: "Opus", sonnet: "Sonnet", haiku: "Haiku" };
@@ -193,6 +193,9 @@ export function PendingPage(p: { user: User; csrf: string; noOwner?: boolean }) 
   );
 }
 
+/** Flash message from a PRG redirect: fixed text, `warn` = the action was stored but did not fully take effect. */
+export interface Notice { text: string; warn?: boolean }
+
 export interface SettingsView {
   user: User;
   csrf: string;
@@ -205,11 +208,13 @@ export interface SettingsView {
   newApiKey?: string; // plaintext, set only in the response to a (re)generate POST
   baseUrl: string; // for the curl example
   lastModel?: string; // model the CLI reported on the latest recorded review
-  seenProjects: { path: string; url: string; lastSeenAt: string }[]; // skipped by the poller, not allowed now; empty when review_all_projects
   engine: EngineChoice; // what engine.ts chooseEngine decided for this user (the same rule the poller uses)
   tokenWarning?: string; // Claude token saved but could not be verified
   error?: string;
   saved?: boolean;
+  notice?: Notice; // shown in the project-list card (the redirects anchor to it)
+  projectError?: string; // add-project validation error, shown in the card
+  projectValue?: string; // the rejected input, kept in the add box
 }
 
 /** One status for a user's Claude credential, shared by the settings page and /admin. Never includes the token itself. */
@@ -281,7 +286,6 @@ export function SettingsPage(p: SettingsView) {
       <h2>設定</h2>
       {p.error && <p class="callout callout-error" role="alert">{p.error}</p>}
       {p.saved && <p class="callout callout-ok" role="status">已儲存。</p>}
-
       <ClaudeTokenCard user={u} csrf={p.csrf} engine={p.engine} warning={p.tokenWarning} />
 
       <section class="card" aria-labelledby="skill-status">
@@ -304,6 +308,47 @@ export function SettingsPage(p: SettingsView) {
             </ul>
           </section>
         )}
+      </section>
+
+      <section class="card" id="review-projects" aria-labelledby="review-projects-h">
+        <h3 id="review-projects-h">自動審查的專案</h3>
+        {p.notice && <p class={`callout ${p.notice.warn ? "callout-warn" : "callout-ok"}`} role="status">{p.notice.text}</p>}
+        {p.projectError && <p class="callout callout-error" role="alert">{p.projectError}</p>}
+        <div class="help">
+          <p><strong>清單是空的＝不會自動審查任何 MR。</strong>要審查全部，請勾選下方表單的「允許所有被指派的 MR」。</p>
+          <ul>
+            <li>每一列是一個專案完整路徑（如 group/project）或 group（如 group/sub，涵蓋其下所有專案）；不分大小寫。</li>
+            <li>按鈕立即生效，不需要按「儲存設定」。</li>
+            <li>只影響自動審查（Reviewer／Assignee 與依 MR Reviewer 觸發）；你自己是作者的 MR 與作者自我審查不受限制。</li>
+            <li>清單外的 MR 不會留言；它們會出現在「審查紀錄」頁頂端的「待你決定的 MR」。</li>
+            <li>解除審查只影響之後的新 MR；你先前用「只審這張」允許的 MR 仍會審到關閉。</li>
+            <li>按下新增／解除會重新載入頁面，請先儲存下方設定。</li>
+          </ul>
+        </div>
+        <div id="review_projects_box" class={u.reviewAllProjects ? "is-superseded" : undefined}>
+          <p class="callout callout-warn" id="review_projects_unrestricted" hidden={!u.reviewAllProjects}>目前不限制：「允許所有被指派的 MR」已開啟，下列清單暫時不生效（內容保留）。</p>
+          {u.reviewProjects.length === 0 ? (
+            <p class="muted">清單是空的，目前不會自動審查任何 MR。</p>
+          ) : (
+            <ul class="proj-list">
+              {u.reviewProjects.map((e) => (
+                <li>
+                  <code>{e}</code>
+                  <form method="post" action="/settings/projects/remove">
+                    <input type="hidden" name="_csrf" value={p.csrf} />
+                    <input type="hidden" name="project" value={e} />
+                    <button type="submit" class="btn btn-quiet" aria-label={`解除審查 ${e}`}>解除審查</button>
+                  </form>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+        <form method="post" action="/settings/projects/add" class="proj-add">
+          <label for="new_project">新增專案或 group</label>
+          <input id="new_project" type="text" name="project" value={p.projectValue ?? ""} maxlength={255} spellcheck={false} autocomplete="off" placeholder="group/project" required />
+          <button type="submit" class="btn btn-primary">新增</button>
+        </form>
       </section>
 
       <form class="card" method="post" action="/settings" enctype="multipart/form-data">
@@ -361,34 +406,6 @@ export function SettingsPage(p: SettingsView) {
             <label for="max_diff_lines">Diff 行數上限（{MIN_DIFF_LINES}–{MAX_DIFF_LINES}）</label>
             <input id="max_diff_lines" type="number" name="max_diff_lines" min={MIN_DIFF_LINES} max={MAX_DIFF_LINES} step="1" value={u.maxDiffLines ?? ""} placeholder={String(p.defaultMaxDiffLines)} aria-describedby="max_diff_lines_help" />
             <p class="help" id="max_diff_lines_help">超過此行數（新增＋刪除，已排除 lock、翻譯、產生檔）的 MR 只會收到「請拆分」留言，不做審查。留空使用預設 {p.defaultMaxDiffLines}。上限越大，越容易漏看問題，也越容易逾時（審查時限會隨行數放寬，最長 15 分鐘）；用量計入你自己的訂閱。</p>
-          </div>
-          <div class="field">
-            <label for="review_projects">自動審查的專案</label>
-            <textarea id="review_projects" name="review_projects" rows={4} maxlength={25500} spellcheck={false} aria-describedby="review_projects_help">{u.reviewProjects.join("\n")}</textarea>
-            <div class="help" id="review_projects_help">
-              <p><strong>留空＝不會自動審查任何 MR。</strong>要審查全部，請勾選下方「允許所有被指派的 MR」。</p>
-              <ul>
-                <li>一行一個 GitLab 專案完整路徑，例如 group/project；不分大小寫。</li>
-                <li>填 group（如 group/sub）會涵蓋其下所有專案。</li>
-                <li>只影響自動審查（Reviewer／Assignee 與依 MR Reviewer 觸發），作者自我審查不受限制。</li>
-                <li>清單外的 MR 不會留言也不會有紀錄。</li>
-              </ul>
-            </div>
-            {p.seenProjects.length > 0 && (
-              <div class="seen-projects" id="seen_projects">
-                <h3>最近出現但未列入的 project</h3>
-                <p class="help">最近 {SEEN_PROJECT_DAYS} 天內有指派給你（或指定你為 Reviewer），但因不在清單內而被略過的專案。按「加入」只會把路徑填進上方欄位，按「儲存設定」後才生效。</p>
-                <ul>
-                  {p.seenProjects.map((s) => (
-                    <li>
-                      <a href={s.url} target="_blank" rel="noopener noreferrer">{s.path}</a> <span class="muted">最後出現 {formatTaipei(s.lastSeenAt)}</span>{" "}
-                      <button type="button" class="btn btn-quiet" data-add-project={s.path} aria-label={`加入 ${s.path}`}>加入</button>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-            <p class="help" id="review_projects_status" role="status" aria-live="polite"></p>
           </div>
           <div class="field">
             <label for="review_all_projects" class="check"><input id="review_all_projects" type="checkbox" name="review_all_projects" value="1" checked={u.reviewAllProjects} aria-describedby="review_all_projects_help" /> <span>允許所有被指派的 MR</span></label>
@@ -515,11 +532,48 @@ function ErrorText(p: { r: ReviewRow }) {
     : r.error ? <span title={r.error}>{r.error.length > 80 ? `${r.error.slice(0, 80)}…` : r.error}</span> : null;
 }
 
-export function ReviewsPage(p: { user: User; csrf: string; rows: ReviewRow[] }) {
+export function ReviewsPage(p: { user: User; csrf: string; rows: ReviewRow[]; pending?: SeenMr[]; notice?: Notice }) {
   const groups = groupReviews(p.rows);
   return (
     <Layout title="審查紀錄" user={p.user} csrf={p.csrf} nav="reviews">
       <h2>審查紀錄</h2>
+      {p.notice && <p class={`callout ${p.notice.warn ? "callout-warn" : "callout-ok"}`} role="status">{p.notice.text}</p>}
+      {p.pending && p.pending.length > 0 && (
+        <section class="card pending-mrs" aria-labelledby="pending-mrs-h">
+          <h3 id="pending-mrs-h">待你決定的 MR（{p.pending.length}）</h3>
+          <div class="help">
+            <p>這些 MR 指派給你，但專案不在你的自動審查清單內，所以沒有被審查（也沒有留言）。兩個按鈕都立即生效：</p>
+            <ul>
+              <li><strong>只審這張</strong>：僅這張 MR，之後每次 push 都會自動審，直到關閉；專案清單不變。</li>
+              <li><strong>允許該專案自動審查</strong>：把專案加入清單，之後指派給你的所有 MR 都會自動審；這張也會立即審查。</li>
+            </ul>
+          </div>
+          <ul>
+            {p.pending.map((m) => {
+              const label = `${m.path}!${m.mrIid}`;
+              return (
+                <li>
+                  <span class="pm-info">
+                    <code>{m.path}</code>{" "}
+                    <a href={m.url} target="_blank" rel="noopener noreferrer">{m.title}<span class="sr-only">（另開新分頁）</span></a>
+                    <span class="muted"> 作者 {m.author ?? "不明"}・最後看到 {formatTaipei(m.lastSeenAt)}</span>
+                  </span>
+                  <span class="pm-act">
+                    <form method="post" action={`/pending-mrs/${m.mrId}/allow-mr`}>
+                      <input type="hidden" name="_csrf" value={p.csrf} />
+                      <button type="submit" class="btn btn-primary" aria-label={`只審這張 ${label}`}>只審這張</button>
+                    </form>
+                    <form method="post" action={`/pending-mrs/${m.mrId}/allow-project`}>
+                      <input type="hidden" name="_csrf" value={p.csrf} />
+                      <button type="submit" class="btn btn-quiet" aria-label={`允許該專案自動審查（${m.path}）`}>允許該專案自動審查</button>
+                    </form>
+                  </span>
+                </li>
+              );
+            })}
+          </ul>
+        </section>
+      )}
       {p.rows.length === 0 ? (
         <p class="empty">尚無審查紀錄。有 MR 指派你擔任 reviewer 後，結果會顯示在這裡。</p>
       ) : (

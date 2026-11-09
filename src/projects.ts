@@ -1,5 +1,7 @@
 // Per-user allowlist of GitLab projects for automatic reviews. Single source of truth: every entry point (poller,
-// retry sweep, trigger) calls projectAllowed(); the settings page and `user set` call parseProjectList().
+// retry sweep, trigger) calls reviewAllowed(); the settings page and `user set` call parseProjectList().
+import { isMrAllowed, type Db } from "./db.ts";
+import type { User } from "./users.ts";
 
 // group[/subgroup...]/project path segment: conservative GitLab path chars, no "." / ".." segments.
 export const SEG = "(?!\\.{1,2}(?:/|$))[A-Za-z0-9_.][A-Za-z0-9_.-]*";
@@ -35,6 +37,14 @@ export function projectAllowed(path: string | undefined, list: readonly string[]
   if (!path) return false;
   const p = path.toLowerCase();
   return list.some((e) => p === e || p.startsWith(`${e}/`));
+}
+
+/**
+ * Should `user` get an automatic review of this MR? Own MRs (the user is the author and assigned themselves as reviewer)
+ * always pass; otherwise the project allowlist / allow-all, or a single MR the user allowed with one click.
+ */
+export function reviewAllowed(db: Db, user: Pick<User, "gitlabUserId" | "reviewProjects" | "reviewAllProjects">, path: string | undefined, mrId: number, authorId?: number): boolean {
+  return authorId === user.gitlabUserId || projectAllowed(path, user.reviewProjects, user.reviewAllProjects) || isMrAllowed(db, user.gitlabUserId, mrId);
 }
 
 const MR_PATH_RE = new RegExp(`^/((?:${SEG}/)+${SEG})/-/merge_requests/(\\d{1,9})/?$`);

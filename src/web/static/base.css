@@ -263,8 +263,12 @@ input.code-input::placeholder { text-transform: none; letter-spacing: .04em; }
 /* settings: project allowlist */
 .help ul { margin: .25rem 0 0; padding-left: 1.25rem; }
 .help p { margin: 0; }
-textarea.is-superseded { opacity: .6; }
-.seen-projects { margin-top: .75rem; }
-.seen-projects ul { list-style: none; margin: .5rem 0 0; padding: 0; max-height: 14rem; overflow: auto; }
-.seen-projects li { display: flex; flex-wrap: wrap; align-items: center; gap: .25rem .75rem; padding: .3rem 0; border-top: 1px solid var(--border); }
-.seen-projects a { overflow-wrap: anywhere; font-family: var(--mono); font-size: .875rem; }
+.is-superseded .proj-list { opacity: .6; }
+.proj-list, .pending-mrs > ul { list-style: none; margin: .5rem 0 0; padding: 0; }
+.proj-list { max-height: 18rem; overflow: auto; }
+.pending-mrs > ul { max-height: 24rem; overflow: auto; }
+.proj-list li, .pending-mrs > ul > li { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .25rem .75rem; padding: .4rem 0; border-top: 1px solid var(--border); }
+.proj-list code, .pm-info { overflow-wrap: anywhere; }
+.pm-act { display: flex; flex-wrap: wrap; gap: .5rem; }
+.proj-add { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-top: .75rem; }
+.proj-add input { flex: 1 1 14rem; }

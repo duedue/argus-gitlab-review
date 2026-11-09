@@ -1,32 +1,12 @@
-// Settings page: allowlist quick-add and allow-all visual state. Nothing is saved until the form is submitted.
-const ta = document.getElementById("review_projects");
+// Settings page: keep the "not restricted" note honest while the allow-all checkbox is toggled (the saved state is what the server rendered).
 const all = document.getElementById("review_all_projects");
-const seen = document.getElementById("seen_projects");
-const status = document.getElementById("review_projects_status");
-
-// Allow-all supersedes the list: dim it (not disabled, so the list is still submitted and kept) and hide the quick-add block.
+const note = document.getElementById("review_projects_unrestricted");
+const saved = !!note && !note.hidden;
 const sync = () => {
-  if (!all) return;
-  ta?.classList.toggle("is-superseded", all.checked);
-  if (seen) seen.hidden = all.checked || !seen.querySelector("li"); // stays hidden once every row was added
+  if (!all || !note) return;
+  note.hidden = !all.checked && !saved;
+  if (all.checked) note.textContent = saved ? "目前不限制：「允許所有被指派的 MR」已開啟，下列清單暫時不生效（內容保留）。" : "「允許所有被指派的 MR」已勾選，儲存後下列清單將暫時不生效（內容保留）。";
+  else if (saved) note.textContent = "已取消勾選，儲存後才會恢復限制；目前仍不限制。";
 };
 all?.addEventListener("change", sync);
 sync();
-
-document.querySelectorAll("[data-add-project]").forEach((b) => {
-  b.addEventListener("click", () => {
-    const path = (b.getAttribute("data-add-project") || "").toLowerCase();
-    if (!ta || !path) return;
-    const lines = ta.value.split("\n").map((l) => l.trim().toLowerCase());
-    if (!lines.includes(path)) ta.value = (ta.value.trim() ? ta.value.replace(/\s*$/, "\n") : "") + path;
-    const li = b.closest("li");
-    const next = (li?.nextElementSibling || li?.previousElementSibling)?.querySelector("button");
-    li?.remove();
-    if (next) next.focus();
-    else {
-      if (seen) seen.hidden = true;
-      ta.focus();
-    }
-    if (status) status.textContent = `已加入 ${path}（尚未儲存）`;
-  });
-});

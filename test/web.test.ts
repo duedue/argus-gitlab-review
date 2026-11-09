@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { serve } from "@hono/node-server";
 import Database from "better-sqlite3";
 import { loadConfig } from "../src/config.ts";
-import { openDb, recordSeenProject, type Db } from "../src/db.ts";
+import { openDb, type Db } from "../src/db.ts";
 import { decrypt } from "../src/crypto.ts";
 import { accessTokenFor, REFRESH_SKEW_MS, type OAuthCtx } from "../src/oauth.ts";
 import { pollCycle } from "../src/runtime.ts";
@@ -524,43 +524,4 @@ test("docs: Docker image ships docs/", () => {
   const root = new URL("../", import.meta.url);
   assert.match(readFileSync(new URL("Dockerfile", root), "utf8"), /^COPY .*\bdocs \.\/docs$/m);
   assert.ok(!readFileSync(new URL(".dockerignore", root), "utf8").split("\n").some((l) => /^\/?docs\/?$/.test(l.trim())));
-});
-
-test("settings: review_projects textarea saves normalized, renders back, rejects bad paths", async () => {
-  const { app, db } = setup();
-  upsertOAuthUser(db, key, { gitlabUserId: 8, username: "rp", accessToken: "a", refreshToken: "r", accessExpiresAt: Date.now() + 1e7 });
-  const s = loginAs(db, 8);
-  assert.equal((await postSettings(app, s, { review_projects: "Grp/A/\r\ngrp/b" })).status, 200);
-  assert.deepEqual(getUserById(db, 8)!.reviewProjects, ["grp/a", "grp/b"]);
-  assert.match(await (await app.request("/settings", { headers: { cookie: s.cookie } })).text(), /name="review_projects"[^>]*>grp\/a\ngrp\/b<\/textarea>/);
-  assert.equal((await postSettings(app, s, { review_projects: "bad path" })).status, 400);
-  assert.deepEqual(getUserById(db, 8)!.reviewProjects, ["grp/a", "grp/b"]);
-  assert.equal((await postSettings(app, s, { review_projects: "" })).status, 200);
-  assert.deepEqual(getUserById(db, 8)!.reviewProjects, []);
-});
-
-test("settings: review_all_projects checkbox persists; quick-add block lists seen not-allowed projects and hides when allowAll", async () => {
-  const { app, db } = setup();
-  upsertOAuthUser(db, key, { gitlabUserId: 9, username: "qa", accessToken: "a", refreshToken: "r", accessExpiresAt: Date.now() + 1e7 });
-  const s = loginAs(db, 9);
-  const html = async () => (await app.request("/settings", { headers: { cookie: s.cookie } })).text();
-  assert.doesNotMatch(await html(), /最近出現但未列入的 project/, "nothing seen yet");
-  recordSeenProject(db, 9, "grp/one", "https://gl.test/grp/one/-/merge_requests/1");
-  recordSeenProject(db, 9, "grp/two", "https://gl.test/grp/two/-/merge_requests/2");
-  let page = await html();
-  assert.match(page, /最近出現但未列入的 project/);
-  assert.match(page, /data-add-project="grp\/one"/);
-  assert.match(page, /href="https:\/\/gl\.test\/grp\/two\/-\/merge_requests\/2"/);
-  assert.match(page, /src="\/static\/settings\.js"/);
-  assert.equal((await app.request("/static/settings.js")).status, 200);
-  assert.doesNotMatch(page, /name="review_all_projects"[^>]*checked/);
-  assert.equal((await postSettings(app, s, { review_projects: "grp/one" })).status, 200);
-  page = await html();
-  assert.doesNotMatch(page, /data-add-project="grp\/one"/, "already allowed -> not offered");
-  assert.match(page, /data-add-project="grp\/two"/);
-  assert.equal((await postSettings(app, s, { review_projects: "grp/one", review_all_projects: "1" })).status, 200);
-  assert.equal(getUserById(db, 9)!.reviewAllProjects, true);
-  page = await html();
-  assert.match(page, /name="review_all_projects"[^>]*checked/);
-  assert.doesNotMatch(page, /最近出現但未列入的 project/, "hidden when allowAll");
 });

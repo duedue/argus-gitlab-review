@@ -4,7 +4,7 @@ import { isDraft } from "./gitlab.ts";
 import { queueKey, type ReviewQueue } from "./queue.ts";
 import { reviewMr, type UserRuntime } from "./review.ts";
 import { engineFields, listUsers, type User } from "./users.ts";
-import { parseMrUrl, projectAllowed } from "./projects.ts";
+import { parseMrUrl, reviewAllowed } from "./projects.ts";
 
 export { parseMrUrl }; // lives in projects.ts (shared with the poller); re-exported for existing importers
 import { chooseEngine, laneFor, type SkipReason } from "./engine.ts";
@@ -88,7 +88,7 @@ export async function triggerReviews(d: TriggerDeps, caller: User, ref: { path: 
   for (const { username, user: u } of targets) {
     if (!u) skip(username, "not an Argus user");
     else if (!u.approved || !u.enabled) skip(u.username, "user not approved or disabled");
-    else if (!opts.self && !projectAllowed(projectPath, u.reviewProjects, u.reviewAllProjects)) skip(u.username, "project not in user's review list");
+    else if (!opts.self && !reviewAllowed(d.db, u, projectPath, mr.id, mr.author?.id)) skip(u.username, "project not in user's review list");
     else if (draft && !opts.self) skip(u.username, "draft MR");
     else if (!u.skillPath) skip(u.username, "no skill uploaded");
     else if (reviewExists(d.db, u.gitlabUserId, mr.id, mr.sha, d.cfg.dryRun)) skip(u.username, "already reviewed or in progress");
