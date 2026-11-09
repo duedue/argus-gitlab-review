@@ -29,7 +29,7 @@ If no `release/*` branch exists the run ends quietly. Any failure before step 4 
 |---|---|
 | `PUBLISH_PAT` | Fine-grained personal access token with **Contents: read and write** on this repository. It pushes `main` and the tag and creates the release, so both are attributed to the token's owner and trigger CI. |
 
-The image push uses the workflow's own `GITHUB_TOKEN` (`packages: write`).
+The image push uses the workflow's own `GITHUB_TOKEN` (`packages: write`). The image carries the `org.opencontainers.image.source` label so the package stays linked to this repository. If the push step fails after the release was created, run the **Push image** workflow (`.github/workflows/image.yml`) with the published version; it rebuilds from the tag and pushes without touching `main`, tags or releases. The package's **Manage Actions access** must grant this repository the Write role.
 
 ## Dependency updates
 
