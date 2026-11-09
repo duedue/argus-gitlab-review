@@ -84,7 +84,7 @@ jobs:
           git add CHANGELOG.md
           git commit -m "docs(changelog): $VERSION"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         if: steps.pick.outputs.skip == 'false'
         with:
           node-version-file: .nvmrc
