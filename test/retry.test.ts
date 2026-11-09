@@ -12,7 +12,7 @@ import { failureNote, sanitizeReason } from "../src/publisher.ts";
 import { ReviewQueue } from "../src/queue.ts";
 import { pollOnce, reviewMr, type UserRuntime } from "../src/review.ts";
 import { createSession } from "../src/sessions.ts";
-import { addUser, getUser, type User } from "../src/users.ts";
+import { addUser, getUser, setUser, type User } from "../src/users.ts";
 import { createApp } from "../src/web/app.tsx";
 
 const key = randomBytes(32);
@@ -490,4 +490,16 @@ test("GET /reviews: every group summary keeps 7 column cells even when model and
   const cols = /<span class="g-line g-cols">([\s\S]*?)<\/span>\s*<span class="g-line/.exec(g)?.[1] ?? g;
   assert.match(cols, /<span class="g-model"><\/span>/, "empty model cell kept");
   assert.match(cols, /<span class="g-find nowrap"><\/span>/, "empty findings cell kept");
+});
+
+test("sweep: a non-self retry whose project left the allowlist is dropped (no run); a self-review row is still retried", async () => {
+  for (const self of [false, true]) {
+    const s = sweepHarness(self);
+    await s.fail();
+    s.db.prepare(`UPDATE reviews SET next_retry_at=1`).run();
+    setUser(s.db, "alice", ["review_all_projects=0", "review_projects=other/proj"]);
+    await quiet(() => pollOnce({ ...s.cfg, gitlabUrl: GL }, s.db, [getUser(s.db, "alice")!], () => s.rt, s.queue));
+    assert.equal(s.runs(), self ? 2 : 1, self ? "self-review unrestricted" : "dropped, not re-run");
+    if (!self) assert.deepEqual({ st: row(s.db).status, n: row(s.db).next_retry_at }, { st: "failed", n: null });
+  }
 });

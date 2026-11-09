@@ -1,5 +1,5 @@
 import type { Config } from "./config.ts";
-import { acceptedIds, markAnnounced, carriedSummaryItems, claimReview, recordSkip, clearRetry, dueRetries, isSelfReview, failReview, releaseClaim, finishReview, lastReviewedBaseSha, lastReviewedSha, nextRound, recordBaseSha, type Db } from "./db.ts";
+import { acceptedIds, markAnnounced, carriedSummaryItems, claimReview, recordSeenProject, recordSkip, clearRetry, dueRetries, isSelfReview, failReview, releaseClaim, finishReview, lastReviewedBaseSha, lastReviewedSha, nextRound, recordBaseSha, type Db } from "./db.ts";
 import { fetchRequirements } from "./jira.ts";
 import { deriveVerdict } from "./findings.ts";
 import { chooseEngine, laneFor, reviewTimeoutMs, SKIP_REASONS, type ReviewEngine } from "./engine.ts";
@@ -10,6 +10,7 @@ import { claimedFixed, failureNote, fp, openAiThreads, publish, resolveThreads, 
 import { queueKey, reviewQueue, type ReviewQueue } from "./queue.ts";
 import { readProjectContext } from "./context.ts";
 import { prepareDiff } from "./repo.ts";
+import { parseMrUrl, projectAllowed } from "./projects.ts";
 import { daysUntilExpiry, engineFields, type User } from "./users.ts";
 
 /** Everything one user's review needs. `engine` is undefined when the subscription guard denies this user. */
@@ -71,11 +72,25 @@ async function pollUser(cfg: Config, db: Db, u: User, runtimeFor: (u: User) => U
       }
     }
     console.log(`[poll] ${u.username}: ${mrs.length} open MR(s) as reviewer${u.reviewAssigned ? "/assignee" : ""} (dryRun=${cfg.dryRun})`);
+    let outside = 0;
     for (const s of mrs) {
       if (isDraft(s)) continue;
+      const path = parseMrUrl(s.web_url, cfg.gitlabUrl)?.path; // undefined (unparseable) fails closed
+      if (!projectAllowed(path, u.reviewProjects, u.reviewAllProjects)) {
+        outside++;
+        if (path) {
+          try {
+            recordSeenProject(db, u.gitlabUserId, path, s.web_url); // feeds the settings quick-add; no reviews row, no comment
+          } catch (e) {
+            console.error(`[poll] ${u.username}: recording skipped project failed:`, (e as Error).message); // must not abort the cycle
+          }
+        }
+        continue;
+      }
       // The user's cycle waits for its reviews, so a long review delays (never overlaps) that user's next step.
       await queue.enqueue(laneFor(engineFields(u), cfg.ownerEngineTestUsers), queueKey(u.gitlabUserId, s.id, s.sha), () => reviewMr(cfg, db, u, rt, s)).done;
     }
+    if (outside) console.log(`[poll] ${u.username}: ${outside} skipped (not in project list)`);
     await sweepRetries(cfg, db, u, rt, queue);
     try {
       await watchAccepts(cfg, db, u, rt, mrs, queue); // `/argus accept` commands usually arrive without a new commit
@@ -100,6 +115,11 @@ async function sweepRetries(cfg: Config, db: Db, u: User, rt: UserRuntime, queue
       if (mr.state !== "opened" || mr.sha !== row.head_sha) {
         clearRetry(db, row.id);
         console.log(`[retry] ${u.username} ${row.project_id}!${row.mr_iid}@${row.head_sha.slice(0, 8)}: ${mr.state !== "opened" ? "MR not open" : "head moved"}; retry dropped`);
+        continue;
+      }
+      if (row.self_review !== 1 && !projectAllowed(parseMrUrl(mr.web_url, cfg.gitlabUrl)?.path, u.reviewProjects, u.reviewAllProjects)) {
+        clearRetry(db, row.id); // list narrowed since the failure; the poller no longer picks this MR up either
+        console.log(`[retry] ${u.username} ${row.project_id}!${row.mr_iid}: not in project list; retry dropped`);
         continue;
       }
       if (row.self_review !== 1 && isDraft(mr)) continue; // like the poller: a draft is skipped, the row is kept until the MR is ready

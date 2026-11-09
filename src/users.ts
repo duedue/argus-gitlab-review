@@ -2,6 +2,7 @@ import { existsSync, statSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { decrypt, encrypt } from "./crypto.ts";
 import type { Db } from "./db.ts";
+import { parseProjectList } from "./projects.ts";
 import { SEVERITIES, type Severity } from "./findings.ts";
 
 export interface User {
@@ -29,6 +30,8 @@ export interface User {
   claudeTokenSetAt: string | null; // UTC "YYYY-MM-DD HH:MM:SS" when it was saved (expiry is estimated from it)
   claudeTokenInvalid: boolean; // the CLI rejected it (401); the user must paste a new one
   maxDiffLines: number | null; // diff size above which this reviewer's reviews are skipped; null = cfg.maxDiffLines
+  reviewProjects: string[]; // normalized allowlist for automatic reviews (strict: [] = none)
+  reviewAllProjects: boolean; // opt-in: auto-review every assigned MR, ignoring reviewProjects
 }
 
 export const MIN_DIFF_LINES = 500;
@@ -72,6 +75,8 @@ const toUser = (r: Record<string, unknown>): User => ({
   claudeTokenSetAt: (r.claude_token_set_at as string | null) ?? null,
   claudeTokenInvalid: r.claude_token_invalid === 1,
   maxDiffLines: (r.max_diff_lines as number | null) ?? null,
+  reviewProjects: ((r.review_projects as string | null) ?? "").split("\n").filter(Boolean),
+  reviewAllProjects: r.review_all_projects === 1,
 });
 
 /** What the engine rule (engine.ts chooseEngine) needs to know about the Claude token: whether one is stored, not its value. */
@@ -97,8 +102,9 @@ export function addUser(
   }
   // Upsert so re-running `user add` rotates the token; thresholds/language/enabled are preserved, ownership never silently dropped.
   db.prepare(
-    `INSERT INTO users (gitlab_user_id, username, token_enc, token_expires_at, skill_path, is_owner)
-     VALUES (@id, @username, @tok, @exp, @skill, @owner)
+    `INSERT INTO users (gitlab_user_id, username, token_enc, token_expires_at, skill_path, is_owner, review_all_projects)
+     VALUES (@id, @username, @tok, @exp, @skill, @owner, 1)` + // CLI-added (owner-driven) users keep reviewing everything; only web sign-ups start strict. Not touched on conflict.
+    `
      ON CONFLICT(gitlab_user_id) DO UPDATE SET username=@username, token_enc=@tok, token_expires_at=@exp,
        skill_path=@skill, is_owner=MAX(is_owner, @owner),
        token_type='pat', refresh_token_enc=NULL, access_expires_at=NULL, token_invalid=0,
@@ -194,6 +200,11 @@ const SETTABLE = {
     if (!Number.isInteger(n) || n < MIN_DIFF_LINES || n > MAX_DIFF_LINES) throw new Error(`max_diff_lines 必須是 ${MIN_DIFF_LINES} 到 ${MAX_DIFF_LINES} 的整數，或留空使用預設`);
     return n;
   },
+  review_projects: (v: string) => parseProjectList(v).join("\n") || null, // comma or newline separated; empty = none (unless review_all_projects=1)
+  review_all_projects: (v: string) => {
+    if (v !== "0" && v !== "1") throw new Error("review_all_projects must be 0 or 1");
+    return Number(v);
+  },
   auto_approve: (v: string) => {
     if (v !== "0" && v !== "1") throw new Error("auto_approve must be 0 or 1");
     return Number(v);
@@ -273,7 +284,7 @@ export function bootstrapOwner(db: Db, u: User, ownerName: string | undefined, w
     warn(`[bootstrap] ARGUS_OWNER=${ownerName} ignored: owner ${owner.username} already exists`);
     return u;
   }
-  db.prepare(`UPDATE users SET is_owner=1, approved=1, enabled=1 WHERE gitlab_user_id=?`).run(u.gitlabUserId);
+  db.prepare(`UPDATE users SET is_owner=1, approved=1, enabled=1, review_all_projects=1 WHERE gitlab_user_id=?`).run(u.gitlabUserId);
   console.log(`[bootstrap] ${u.username} promoted to owner via ARGUS_OWNER`);
   return getUserById(db, u.gitlabUserId)!;
 }

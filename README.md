@@ -116,7 +116,7 @@ Set in `.env` (compose passes the file to the container). Template: [.env.exampl
 
 Per-user `engine` (`claude-cli` default, `codex-cli` experimental) is owner-only: `user set <u> engine=codex-cli` or the per-user select on `/admin`. It is an explicit choice, never inferred; the subscription guard below applies to both.
 
-Per-user (set with `user set` or on the web `/settings`): `model` (empty = CLI default, or `opus` / `sonnet` / `haiku`; applies to the `claude-cli` engine only, passed as `claude --model <alias>`), `skill_path`, `severity_threshold` (`minor`), `confidence_threshold` (`0.7`), `language` (`zh-TW`, applied to all finding titles/bodies), `enabled`, `auto_approve` (`0`, see below).
+Per-user (set with `user set` or on the web `/settings`): `model` (empty = CLI default, or `opus` / `sonnet` / `haiku`; applies to the `claude-cli` engine only, passed as `claude --model <alias>`), `skill_path`, `severity_threshold` (`minor`), `confidence_threshold` (`0.7`), `language` (`zh-TW`, applied to all finding titles/bodies), `enabled`, `auto_approve` (`0`, see below), `review_projects` (strict allowlist, empty = review nothing; comma/newline-separated GitLab project paths or group prefixes, e.g. `review_projects=grp/a,grp/sub`), `review_all_projects` (`0`/`1`; `1` ignores the list and reviews every assigned MR; web sign-ups start at `0`; the owner and `user add` users at `1`). Both limit automatic reviews only; self-review is never restricted.
 
 ### Model and what actually ran
 

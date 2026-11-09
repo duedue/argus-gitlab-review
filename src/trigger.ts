@@ -4,6 +4,9 @@ import { isDraft } from "./gitlab.ts";
 import { queueKey, type ReviewQueue } from "./queue.ts";
 import { reviewMr, type UserRuntime } from "./review.ts";
 import { engineFields, listUsers, type User } from "./users.ts";
+import { parseMrUrl, projectAllowed } from "./projects.ts";
+
+export { parseMrUrl }; // lives in projects.ts (shared with the poller); re-exported for existing importers
 import { chooseEngine, laneFor, type SkipReason } from "./engine.ts";
 
 /** Machine-readable skip reasons for the trigger response (the UI/history shows the zh-TW text from SKIP_REASONS). */
@@ -19,27 +22,6 @@ export class TriggerError extends Error {
   constructor(public status: 400 | 401 | 404 | 502, public code: string) {
     super(code);
   }
-}
-
-// group[/subgroup...]/project/-/merge_requests/<iid>; segments are conservative GitLab path chars, no "." / ".." segments.
-const SEG = "(?!\\.{1,2}(?:/|$))[A-Za-z0-9_.][A-Za-z0-9_.-]*";
-const MR_PATH_RE = new RegExp(`^/((?:${SEG}/)+${SEG})/-/merge_requests/(\\d{1,9})/?$`);
-
-/** Strict parse of a GitLab MR web URL that lives under `gitlabUrl`. Returns undefined for anything else. */
-export function parseMrUrl(raw: unknown, gitlabUrl: string): { path: string; iid: number } | undefined {
-  if (typeof raw !== "string" || raw.length > 512) return undefined;
-  let u: URL, base: URL;
-  try {
-    u = new URL(raw);
-    base = new URL(gitlabUrl);
-  } catch {
-    return undefined;
-  }
-  if (u.origin !== base.origin || u.username || u.password) return undefined;
-  const prefix = base.pathname.replace(/\/+$/, "");
-  if (!u.pathname.startsWith(`${prefix}/`)) return undefined;
-  const m = MR_PATH_RE.exec(u.pathname.slice(prefix.length));
-  return m ? { path: m[1]!, iid: Number(m[2]) } : undefined;
 }
 
 /** In-memory fixed-window limiter per key (resets on restart; fine for a single-process service). */
@@ -94,6 +76,7 @@ export async function triggerReviews(d: TriggerDeps, caller: User, ref: { path: 
   }
   if (mr.state !== "opened") throw new TriggerError(400, "mr_not_open");
 
+  const projectPath = parseMrUrl(mr.web_url, d.cfg.gitlabUrl)?.path ?? ref.path; // canonical path, same source as the poller and the sweep
   const draft = isDraft(mr);
   const byId = new Map(listUsers(d.db).map((u) => [u.gitlabUserId, u]));
   const out: TriggerResult = { queued: [], skipped: [] };
@@ -105,6 +88,7 @@ export async function triggerReviews(d: TriggerDeps, caller: User, ref: { path: 
   for (const { username, user: u } of targets) {
     if (!u) skip(username, "not an Argus user");
     else if (!u.approved || !u.enabled) skip(u.username, "user not approved or disabled");
+    else if (!opts.self && !projectAllowed(projectPath, u.reviewProjects, u.reviewAllProjects)) skip(u.username, "project not in user's review list");
     else if (draft && !opts.self) skip(u.username, "draft MR");
     else if (!u.skillPath) skip(u.username, "no skill uploaded");
     else if (reviewExists(d.db, u.gitlabUserId, mr.id, mr.sha, d.cfg.dryRun)) skip(u.username, "already reviewed or in progress");

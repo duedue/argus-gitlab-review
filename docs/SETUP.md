@@ -61,7 +61,7 @@ docker compose up -d --build
    | Jira API token (optional) | Argus reads the Jira requirement linked to an MR only if this is filled in and `JIRA_URL` is set in `.env` |
    | Setup code | From the previous step; it is invalidated once used |
 
-5. You are redirected to the login page. Click **Log in with GitLab** (「使用 GitLab 登入」) and authorize. You are the owner.
+5. You are redirected to the login page. Click **Log in with GitLab** (「使用 GitLab 登入」) and authorize. You are the owner, and "Allow all assigned MRs" (「允許所有被指派的 MR」) is already checked for you, so all your assigned MRs are reviewed.
 
 You can also skip `/setup`: set `OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET`, and `ARGUS_OWNER` in `.env` and run `docker compose up -d`.
 
@@ -82,7 +82,7 @@ The review engine is Claude Code. The owner's reviews run on the `claude` login 
 
 Login data is stored in a Docker volume (`claude-home`) and survives upgrades and restarts.
 
-> Other colleagues are in "Awaiting approval" (「等待核准」) after they log in. Click **Approve** (「核准」) for them on `/admin`; they are reviewed only after they paste their own Claude token under Settings. The "Claude token" column of the `/admin` user table shows each person's status (set / not set / invalid / uses owner's container login; 「已設定」「未設定」「失效」「使用 owner 容器登入」), and the "Last review" column (「最近一次審查」) shows the latest result, e.g. "Skipped (token not set)" (「略過（未設定 token）」). The table never shows any token content.
+> Other colleagues are in "Awaiting approval" (「等待核准」) after they log in. Click **Approve** (「核准」) for them on `/admin`; they are reviewed only after they paste their own Claude token under Settings. Colleagues who sign up on the web also start with a strict project allowlist and no automatic reviews at all (the owner and users created with the CLI `user add` start with "Allow all assigned MRs" checked): under Settings they must fill in "Projects to review automatically" (「自動審查的專案」) or check "Allow all assigned MRs". The "Claude token" column of the `/admin` user table shows each person's status (set / not set / invalid / uses owner's container login; 「已設定」「未設定」「失效」「使用 owner 容器登入」), and the "Last review" column (「最近一次審查」) shows the latest result, e.g. "Skipped (token not set)" (「略過（未設定 token）」). The table never shows any token content.
 
 ## 5. Going live (review publish mode)
 

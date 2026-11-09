@@ -7,7 +7,7 @@ Note: the Argus web UI is in Traditional Chinese. UI labels are given here in En
 ## 1. Login and approval
 
 1. Open the Argus URL, click **Log in with GitLab** (「使用 GitLab 登入」), and authorize (scopes: `api`, `read_repository`).
-2. A new account stays at "Awaiting approval" (「等待核准」). Meanwhile you can prepare your skill and thresholds under Settings (「設定」), but **reviews start only after the owner approves you**.
+2. A new account stays at "Awaiting approval" (「等待核准」). Meanwhile you can prepare your skill and thresholds under Settings (「設定」), but **reviews start only after the owner approves you**. A new account also **does not review any MR automatically**: under Settings, fill in "Projects to review automatically" (「自動審查的專案」) or check "Allow all assigned MRs" (「允許所有被指派的 MR」).
 3. Argus reads MRs and publishes comments under your GitLab identity.
 
 4. **Set your own Claude token** (next section). If it is not set, MRs assigned to you are recorded as "skipped" (「略過」), and Argus does not fall back to the owner's subscription.
@@ -57,6 +57,9 @@ The "Settings" menu (「設定」):
 | Minimum severity (「最低嚴重度」) | `nit` < `minor` < `major` < `blocker`. Findings below the threshold, or without a line number, are not posted inline and are listed in the summary comment instead (the threshold only decides placement; it never hides content) |
 | Minimum confidence, 0-1 (「最低信心值（0–1）」) | Same idea: findings below this value are not posted inline. Higher is more conservative |
 | Diff line limit (「Diff 行數上限」) | An integer from 500 to 8000; leave empty for the default 2000. MRs above it only get a "please split" comment. The larger the limit, the easier it is to miss problems and the more likely a timeout (the review time limit scales with diff lines, up to 15 minutes); usage counts against your own subscription |
+| Projects to review automatically (「自動審查的專案」) | One full GitLab project path per line (e.g. `group/project`). **Empty means nothing is reviewed** (strict allowlist); to review everything, check the next item. A group path (e.g. `group/sub`) covers every project under it (matched on path segments: `group/sub` does not include `group/subx`); case-insensitive. It only affects automatic reviews (the reviewer/assignee polling and the trigger API when it picks reviewers from the MR); MRs outside the list are skipped silently, with no comment and no review record. Self-review by the author is never restricted. CLI: `user set <u> review_projects=a/b,c/d` (comma- or newline-separated, empty clears it); at most 100 entries of 255 characters each |
+| Allow all assigned MRs (「允許所有被指派的 MR」) | When checked, MRs assigned to you are reviewed automatically whatever their project, and the list above stops restricting for now (its content is kept and applies again once you uncheck). Off by default for new web sign-ups. CLI: `user set <u> review_all_projects=1`. Existing users were set to checked on upgrade, so their behavior is unchanged |
+| Recently seen projects not in the list (「最近出現但未列入的 project」) | Shown under the list field (hidden while "Allow all" is checked). Lists projects from the last 30 days where an MR was assigned to you (or named you as Reviewer) but was skipped because the project is not in the list, with a link to the latest MR and the time it was last seen. **Add** (「加入」) only puts the path into the field; it takes effect after you click **Save settings** (「儲存設定」). There is no "ignore" button; entries not seen for 30 days disappear on their own |
 | Review language (「審查語言」) | A BCP-47 code such as `zh-TW`, `en`, `ja`; `zh*` uses the Chinese layout, anything else shows the summary headings in the English layout |
 | Claude model (「Claude 模型」) | `CLI default` (`CLI 預設`) / `Opus` / `Sonnet` / `Haiku`. This is only a request; the model actually used is shown as "Most recently used" (「最近一次實際使用」) in the field's help text and in Review history |
 | Also review MRs where I am the Assignee (「也審查 Assignee 是我的 MR」) | By default only MRs where you are the Reviewer are reviewed; when on, MRs where you are the Assignee are reviewed too. MRs you authored are not affected by this switch (use self-review for those). Off by default |
@@ -68,7 +71,7 @@ The "Settings" menu (「設定」):
 
 | Method | Details |
 |---|---|
-| Assigned as reviewer | Argus polls about every 30 seconds for open MRs assigned to you and reviews each new head commit once. Draft MRs are not reviewed |
+| Assigned as reviewer | Argus polls about every 30 seconds for open MRs assigned to you and reviews each new head commit once. Draft MRs are not reviewed; the project must be in "Projects to review automatically", or "Allow all assigned MRs" must be checked |
 | Assigned as assignee (optional) | After you turn on "Also review MRs where I am the Assignee" in Settings, open MRs where you are the Assignee are reviewed too (deduplicated against the reviewer list); MRs you authored are excluded. Off by default |
 | Self-review (trigger API) | The author calls it after opening an MR to review their own MR with their own skill; drafts are allowed |
 | New push | When the head commit changes, another round runs (incremental: only the diff since the last review; if the author merged the target branch into the MR, that round looks at the whole MR's changes) |

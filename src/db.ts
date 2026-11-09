@@ -45,6 +45,14 @@ export function openDb(path: string): Db {
       token_invalid INTEGER NOT NULL DEFAULT 0, -- refresh was rejected: user must log in again
       approved INTEGER NOT NULL DEFAULT 1       -- web sign-ups start at 0 (pending); CLI-added users are approved
     );
+    -- Projects the poller skipped for a user (not on their allowlist): feeds the settings page quick-add. Never read by the review path.
+    CREATE TABLE IF NOT EXISTS seen_projects (
+      gitlab_user_id INTEGER NOT NULL,
+      project_path TEXT NOT NULL,
+      last_mr_url TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL,               -- UTC "YYYY-MM-DD HH:MM:SS"
+      PRIMARY KEY (gitlab_user_id, project_path)
+    );
     CREATE TABLE IF NOT EXISTS sessions (
       id_hash TEXT PRIMARY KEY,                 -- sha256 of the cookie value
       user_id INTEGER NOT NULL,
@@ -126,6 +134,8 @@ function addMissingColumns(db: Db): void {
       ["claude_token_set_at", "TEXT"], // UTC datetime it was saved; the 1-year expiry is estimated from it
       ["claude_token_invalid", "INTEGER NOT NULL DEFAULT 0"], // the CLI rejected it (401): user must paste a new one
       ["max_diff_lines", "INTEGER"], // per-user diff size limit; NULL = the global default (cfg.maxDiffLines)
+      ["review_projects", "TEXT"], // newline-separated normalized project paths/group prefixes to auto-review (strict: empty = none unless review_all_projects)
+      ["review_all_projects", "INTEGER NOT NULL DEFAULT 0"], // 1 = auto-review every assigned MR regardless of review_projects; new users start at 0
     ],
     reviews: [
       ["mr_url", "TEXT"],
@@ -156,6 +166,9 @@ function addMissingColumns(db: Db): void {
     if (added.has("reviews.next_retry_at")) {
       db.prepare(`UPDATE reviews SET next_retry_at=? WHERE status='failed' AND attempts<3`).run(Date.now());
     }
+    // Strict allowlist (review_all_projects) arrived after active users were already reviewing everything: keep them on 1, once.
+    // Pending (unapproved) users never got reviews, so they start strict like any new sign-up.
+    if (added.has("users.review_all_projects")) db.prepare(`UPDATE users SET review_all_projects=1 WHERE approved=1`).run();
   })();
 }
 
@@ -269,6 +282,23 @@ export function clearRetry(db: Db, id: number): void {
 export function resetFailed(db: Db, id: number, ownerId: number): boolean {
   return db.prepare(`DELETE FROM reviews WHERE id=? AND owner_id=? AND status='failed'`).run(id, ownerId).changes === 1;
 }
+
+export const SEEN_PROJECT_DAYS = 30;
+
+/** Upsert one skipped project for a user (poll only) and prune that user's rows older than the window. */
+export function recordSeenProject(db: Db, userId: number, path: string, mrUrl: string): void {
+  db.prepare(
+    `INSERT INTO seen_projects (gitlab_user_id, project_path, last_mr_url, last_seen_at) VALUES (?, ?, ?, datetime('now'))
+     ON CONFLICT(gitlab_user_id, project_path) DO UPDATE SET last_mr_url=excluded.last_mr_url, last_seen_at=excluded.last_seen_at`,
+  ).run(userId, path.toLowerCase(), mrUrl);
+  db.prepare(`DELETE FROM seen_projects WHERE gitlab_user_id=? AND last_seen_at < datetime('now', ?)`).run(userId, `-${SEEN_PROJECT_DAYS} days`);
+}
+
+/** Projects skipped for this user within the window, most recent first. */
+export const listSeenProjects = (db: Db, userId: number): { path: string; url: string; lastSeenAt: string }[] =>
+  (db.prepare(`SELECT project_path, last_mr_url, last_seen_at FROM seen_projects WHERE gitlab_user_id=? AND last_seen_at >= datetime('now', ?) ORDER BY last_seen_at DESC, project_path`)
+    .all(userId, `-${SEEN_PROJECT_DAYS} days`) as { project_path: string; last_mr_url: string; last_seen_at: string }[])
+    .map((r) => ({ path: r.project_path, url: r.last_mr_url, lastSeenAt: r.last_seen_at }));
 
 /** True when the head is claimed and not re-claimable (a due automatic retry or a no-engine skip may be claimed again). */
 export function reviewExists(db: Db, ownerId: number, mrId: number, headSha: string, dryRun: boolean, now = Date.now()): boolean {

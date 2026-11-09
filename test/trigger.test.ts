@@ -14,7 +14,7 @@ import { pollOnce, type UserRuntime } from "../src/review.ts";
 import { runLoop } from "../src/runtime.ts";
 import { createSession } from "../src/sessions.ts";
 import { parseMrUrl } from "../src/trigger.ts";
-import { addUser, getUser, setUserEnabled, type User } from "../src/users.ts";
+import { addUser, getUser, setUser, setUserEnabled, type User } from "../src/users.ts";
 import { createApp } from "../src/web/app.tsx";
 
 const key = randomBytes(32);
@@ -278,4 +278,21 @@ test("trigger self: reviews as the caller even when not a reviewer, drafts allow
 test("trigger self: non-boolean self is rejected", async () => {
   const t = setup();
   assert.equal((await t.trigger({ mr_url: MR_URL, self: "yes" })).status, 400);
+});
+
+test("trigger: the allowlist is checked against the MR's canonical web_url path, not the caller's URL", async () => {
+  const run = async (webUrl: string, refUrl: string, list: string) => {
+    const t = setup({ mr: mkMr({ web_url: webUrl, reviewers: [{ id: 2, username: "alice" }] }) });
+    t.add(2, "alice");
+    setUser(t.db, "alice", ["review_all_projects=0", `review_projects=${list}`]);
+    const body = await (await t.trigger({ mr_url: refUrl })).json() as { queued: string[]; skipped: { username: string; reason: string }[] };
+    await t.queue.idle();
+    return body;
+  };
+  // caller used a stale/renamed path that is not listed; the canonical one is -> queued
+  assert.deepEqual((await run(MR_URL, `${GL}/old/name/-/merge_requests/7`, "grp/sub")).queued, ["alice"]);
+  // caller's path is listed but the canonical one is not -> skipped
+  const r = await run(`${GL}/other/proj/-/merge_requests/7`, MR_URL, "grp/sub");
+  assert.deepEqual(r.queued, []);
+  assert.deepEqual(r.skipped, [{ username: "alice", reason: "project not in user's review list" }]);
 });

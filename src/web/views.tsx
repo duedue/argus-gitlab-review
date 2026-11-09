@@ -5,6 +5,7 @@ import type { ApiKeyInfo } from "../apikeys.ts";
 import type { ClaudeAuth, CodexAuth, ConnectionTest } from "../engine-status.ts";
 import type { OperatorCommands } from "../commands.ts";
 import { CLAUDE_TOKEN_WARN_DAYS, claudeTokenDaysLeft, ENGINES, MAX_DIFF_LINES, MIN_DIFF_LINES, MODELS, userStatus, type User } from "../users.ts";
+import { SEEN_PROJECT_DAYS } from "../db.ts";
 import { SKIP_REASONS, type EngineChoice } from "../engine.ts";
 
 const MODEL_LABEL: Record<string, string> = { opus: "Opus", sonnet: "Sonnet", haiku: "Haiku" };
@@ -204,6 +205,7 @@ export interface SettingsView {
   newApiKey?: string; // plaintext, set only in the response to a (re)generate POST
   baseUrl: string; // for the curl example
   lastModel?: string; // model the CLI reported on the latest recorded review
+  seenProjects: { path: string; url: string; lastSeenAt: string }[]; // skipped by the poller, not allowed now; empty when review_all_projects
   engine: EngineChoice; // what engine.ts chooseEngine decided for this user (the same rule the poller uses)
   tokenWarning?: string; // Claude token saved but could not be verified
   error?: string;
@@ -361,6 +363,38 @@ export function SettingsPage(p: SettingsView) {
             <p class="help" id="max_diff_lines_help">超過此行數（新增＋刪除，已排除 lock、翻譯、產生檔）的 MR 只會收到「請拆分」留言，不做審查。留空使用預設 {p.defaultMaxDiffLines}。上限越大，越容易漏看問題，也越容易逾時（審查時限會隨行數放寬，最長 15 分鐘）；用量計入你自己的訂閱。</p>
           </div>
           <div class="field">
+            <label for="review_projects">自動審查的專案</label>
+            <textarea id="review_projects" name="review_projects" rows={4} maxlength={25500} spellcheck={false} aria-describedby="review_projects_help">{u.reviewProjects.join("\n")}</textarea>
+            <div class="help" id="review_projects_help">
+              <p><strong>留空＝不會自動審查任何 MR。</strong>要審查全部，請勾選下方「允許所有被指派的 MR」。</p>
+              <ul>
+                <li>一行一個 GitLab 專案完整路徑，例如 group/project；不分大小寫。</li>
+                <li>填 group（如 group/sub）會涵蓋其下所有專案。</li>
+                <li>只影響自動審查（Reviewer／Assignee 與依 MR Reviewer 觸發），作者自我審查不受限制。</li>
+                <li>清單外的 MR 不會留言也不會有紀錄。</li>
+              </ul>
+            </div>
+            {p.seenProjects.length > 0 && (
+              <div class="seen-projects" id="seen_projects">
+                <h3>最近出現但未列入的 project</h3>
+                <p class="help">最近 {SEEN_PROJECT_DAYS} 天內有指派給你（或指定你為 Reviewer），但因不在清單內而被略過的專案。按「加入」只會把路徑填進上方欄位，按「儲存設定」後才生效。</p>
+                <ul>
+                  {p.seenProjects.map((s) => (
+                    <li>
+                      <a href={s.url} target="_blank" rel="noopener noreferrer">{s.path}</a> <span class="muted">最後出現 {formatTaipei(s.lastSeenAt)}</span>{" "}
+                      <button type="button" class="btn btn-quiet" data-add-project={s.path} aria-label={`加入 ${s.path}`}>加入</button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            <p class="help" id="review_projects_status" role="status" aria-live="polite"></p>
+          </div>
+          <div class="field">
+            <label for="review_all_projects" class="check"><input id="review_all_projects" type="checkbox" name="review_all_projects" value="1" checked={u.reviewAllProjects} aria-describedby="review_all_projects_help" /> <span>允許所有被指派的 MR</span></label>
+            <p class="help help-check" id="review_all_projects_help">勾選後，指派給你的 MR 不論專案都會自動審查，上方清單暫時不再限制（清單內容會保留，取消勾選後恢復限制）。作者自我審查不受影響。預設關閉。</p>
+          </div>
+          <div class="field">
             <label for="auto_approve" class="check"><input id="auto_approve" type="checkbox" name="auto_approve" value="1" checked={u.autoApprove} aria-describedby="auto_approve_help" /> <span>自動 approve</span></label>
             <p class="help help-check" id="auto_approve_help">審查結論為可合併、且沒有 minor 以上問題時，自動替這份 MR 按 approve。Approve 會顯示在你自己的名下，並附一則註記標明由 Argus 執行；之後若發現問題會自動撤回。預設關閉。</p>
           </div>
@@ -371,6 +405,7 @@ export function SettingsPage(p: SettingsView) {
         </fieldset>
         <button type="submit" class="btn btn-primary">儲存設定</button>
       </form>
+      <script src="/static/settings.js" defer></script>
 
       <section class="card api-key" aria-labelledby="api-key">
         <h3 id="api-key">Argus API key</h3>

@@ -6,7 +6,7 @@ import { bodyLimit } from "hono/body-limit";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import type { Config } from "../config.ts";
 import { API_KEY_RE, createApiKey, findApiKey, getApiKeyInfo, touchApiKey } from "../apikeys.ts";
-import { isSelfReview, lastModelUsed, resetFailed, type Db } from "../db.ts";
+import { isSelfReview, lastModelUsed, listSeenProjects, resetFailed, type Db } from "../db.ts";
 import { operatorCommands } from "../commands.ts";
 import { claudeAuthStatus, claudeTestConnection, codexLoginStatus, ttlCache, type ConnectionTest } from "../engine-status.ts";
 import { exchangeCode, fetchIdentity, newAuthRequest, type OAuthCtx } from "../oauth.ts";
@@ -17,6 +17,7 @@ import { checkSetupCode, completeSetup, setDryRun, validateSetupInput } from "..
 import { createSession, deleteSession, getSession, safeEqual, SESSION_TTL_MS } from "../sessions.ts";
 import { MAX_SKILL_BYTES, managedSkillPath, saveSkill, scanSkill, validateSkillText } from "../skills.ts";
 import { bootstrapOwner, clearClaudeToken, engineFields, getUserById, hasOwner, listUsers, parseSettings, setClaudeToken, setUser, setUserEnabled, upsertOAuthUser, userStatus, validateClaudeToken, type User } from "../users.ts";
+import { projectAllowed } from "../projects.ts";
 import { chooseEngine, laneFor } from "../engine.ts";
 import { makeRateLimiter, parseMrUrl, TRIGGER_LIMIT_PER_HOUR, triggerReviews, TriggerError } from "../trigger.ts";
 import { DOCS, loadDocs, type DocKey } from "./docs.ts";
@@ -42,6 +43,7 @@ type Env = { Variables: { user: User; csrf: string } };
 
 const asset = (f: string) => readFileSync(new URL(`./static/${f}`, import.meta.url));
 const CSS = asset("base.css").toString("utf8");
+const SETTINGS_JS = asset("settings.js").toString("utf8");
 const ICON = asset("argus-icon.png");
 const FAVICON = asset("favicon.png");
 const SETUP_CSRF_COOKIE = "setup_csrf";
@@ -101,6 +103,7 @@ export function createApp({
 
   app.get("/static/base.css", (c) => c.body(CSS, 200, { "Content-Type": "text/css; charset=utf-8", "Cache-Control": "no-cache" }));
 
+  app.get("/static/settings.js", (c) => c.body(SETTINGS_JS, 200, { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "no-cache" }));
   app.get("/static/argus-icon.png", (c) => c.body(ICON, 200, { "Content-Type": "image/png", "Cache-Control": "public, max-age=86400" }));
   app.get("/static/favicon.png", (c) => c.body(FAVICON, 200, { "Content-Type": "image/png", "Cache-Control": "public, max-age=86400" }));
 
@@ -237,7 +240,9 @@ export function createApp({
       user: u, csrf: csrfToken, skillText, hasExternalSkill: !!u.skillPath && !own,
       apiKey: getApiKeyInfo(db, u.gitlabUserId), baseUrl: cfg.web.baseUrl, lastModel: lastModelUsed(db, u.gitlabUserId),
       warnings: own ? scanSkill(skillText) : [], maxSkillKb: MAX_SKILL_BYTES / 1024, defaultMaxDiffLines: cfg.maxDiffLines,
-      engine: chooseEngine(engineFields(u), cfg.ownerEngineTestUsers), ...extra,
+      engine: chooseEngine(engineFields(u), cfg.ownerEngineTestUsers),
+      seenProjects: u.reviewAllProjects ? [] : listSeenProjects(db, u.gitlabUserId).filter((s) => !projectAllowed(s.path, u.reviewProjects, false)),
+      ...extra,
     };
   };
 
@@ -267,7 +272,7 @@ export function createApp({
   app.post("/settings", tooLarge, authed, csrf, async (c) => {
     const body = await c.req.parseBody();
     const str = (k: string) => (typeof body[k] === "string" ? (body[k] as string) : "");
-    const pairs = [`severity_threshold=${str("severity_threshold")}`, `confidence_threshold=${str("confidence_threshold")}`, `language=${str("language").trim()}`, `auto_approve=${str("auto_approve") === "1" ? 1 : 0}`, `review_assigned=${str("review_assigned") === "1" ? 1 : 0}`, `max_diff_lines=${str("max_diff_lines").trim()}`];
+    const pairs = [`severity_threshold=${str("severity_threshold")}`, `confidence_threshold=${str("confidence_threshold")}`, `language=${str("language").trim()}`, `auto_approve=${str("auto_approve") === "1" ? 1 : 0}`, `review_assigned=${str("review_assigned") === "1" ? 1 : 0}`, `max_diff_lines=${str("max_diff_lines").trim()}`, `review_projects=${str("review_projects").replace(/\r\n/g, "\n")}`, `review_all_projects=${str("review_all_projects") === "1" ? 1 : 0}`];
     // The select is disabled for codex-cli users (not submitted): an absent field keeps the stored value instead of clearing it.
     if (typeof body.model === "string") pairs.push(`model=${body.model}`);
     const pasted = str("skill_text").replace(/\r\n/g, "\n"); // browsers submit CRLF
