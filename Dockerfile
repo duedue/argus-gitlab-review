@@ -2,7 +2,9 @@
 FROM node:22-bookworm-slim
 
 # git: shallow clones of the MRs under review; ripgrep: fast search for the review agents; ca-certificates: HTTPS to GitLab/Jira/model APIs.
+# upgrade: pick up Debian security fixes not yet in the base image (e.g. libbrotli1, CVE-2026-111497).
 RUN apt-get update \
+ && apt-get upgrade -y \
  && apt-get install -y --no-install-recommends git ca-certificates ripgrep \
  && rm -rf /var/lib/apt/lists/*
 
