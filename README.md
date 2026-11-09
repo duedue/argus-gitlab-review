@@ -205,6 +205,7 @@ Caveats for the experimental `codex-cli` engine:
 - Users are polled independently; one user's failure never stops the others. A warning is logged when a token expires within 7 days; expired tokens are skipped.
 
 - Dedupe on `(owner_id, mr_id, head_sha)`; failed reviews are retried automatically (up to 3 attempts, after 5 then 15 min); after the final failure Argus posts one note on the MR. A per-cycle retry sweep also retries failed reviews the poller never lists (author self-reviews, MRs without you as reviewer), keeping self-review mode. Reviews interrupted by a restart are released and re-run. A failed row also has a "重新審查" button in the history page. Dry-run rows are tracked separately and never block a live run.
+- Clone cleanup: review clones are pruned hourly per user when idle for more than 14 days or when their packs exceed 1 GiB; the next review simply re-fetches (see [SETUP.md](docs/SETUP.md)).
 - Incremental: diff since the last successfully reviewed `head_sha` (falls back to full MR diff).
 - Diff > 2000 lines (after exclusions) -> one "please split" note, no review.
 - Findings that already have a posted comment (fingerprint of file+title in a hidden marker) are not re-posted.

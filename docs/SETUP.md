@@ -134,6 +134,8 @@ docker compose up -d
 
 Data is stored in three Docker volumes (names are prefixed with the compose project name, which defaults to the directory name, e.g. `argus-gitlab-review_argus-data`): `argus-data` (database, skills, each user's encrypted Claude token, each user's separate Claude config directory `engines/<GitLab user ID>/claude`, and clones in `clones/u<GitLab user ID>/`), `claude-home` (the owner's container claude login), and `codex-home`.
 
+**Clone disk usage (automatic cleanup)**: every review adds a pack (roughly one full snapshot) to the clone, and clones are kept per user, so disk usage grows over time. Once an hour per user, Argus deletes any `clones/u<GitLab user ID>/<project ID>` directory that matches either condition: (1) it has not been used by a review for more than **14 days** (based on the `.argus-last-used` timestamp inside the clone), or (2) its `.git/objects/pack` totals more than **1 GiB**. The `clones/u<ID>` directory of a user who no longer exists in the database is removed as well. After a deletion the next review only needs a fresh shallow fetch (a few seconds) and the review result is unaffected; each deletion logs one line (`[cleanup] removed ...`, with the reason and size). Entries that do not match the `clones/u<digits>/<digits>` layout are never touched, only mentioned in the log.
+
 **Backup**: back up at least `.env` (especially the master key) and the `argus-data` volume.
 
 **Stopping the service**: `docker compose down` only removes the container; volumes and `.env` are kept, and `up -d` again restores it.

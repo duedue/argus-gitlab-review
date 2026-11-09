@@ -2,16 +2,16 @@ import type { Config } from "./config.ts";
 import { acceptedIds, markAnnounced, carriedSummaryItems, claimReview, recordSeenProject, recordSkip, clearRetry, dueRetries, isSelfReview, failReview, releaseClaim, finishReview, lastReviewedBaseSha, lastReviewedSha, nextRound, recordBaseSha, type Db } from "./db.ts";
 import { fetchRequirements } from "./jira.ts";
 import { deriveVerdict } from "./findings.ts";
-import { chooseEngine, laneFor, reviewTimeoutMs, SKIP_REASONS, type ReviewEngine } from "./engine.ts";
+import { chooseEngine, laneFor, reviewTimeoutMs, SHARED_LOGIN_LANE, SKIP_REASONS, type ReviewEngine } from "./engine.ts";
 import { GitLab, isDraft, type MrSummary } from "./gitlab.ts";
 import { syncApproval } from "./approve.ts";
 import { acceptedItems, afterAccept, resolveAccepted, watchAccepts } from "./accept.ts";
 import { claimedFixed, failureNote, fp, openAiThreads, publish, resolveThreads, threadsToResolve } from "./publisher.ts";
 import { queueKey, reviewQueue, type ReviewQueue } from "./queue.ts";
 import { readProjectContext } from "./context.ts";
-import { prepareDiff } from "./repo.ts";
+import { cleanupDue, cloneUserIds, prepareDiff, pruneUserClones, removeUserClones } from "./repo.ts";
 import { parseMrUrl, projectAllowed } from "./projects.ts";
-import { daysUntilExpiry, engineFields, type User } from "./users.ts";
+import { daysUntilExpiry, engineFields, listUsers, type User } from "./users.ts";
 
 /** Everything one user's review needs. `engine` is undefined when the subscription guard denies this user. */
 export interface UserRuntime {
@@ -46,7 +46,44 @@ export function tooLargeNote(lines: number, limit: number, baseUrl: string): str
  * `runtimeFor` may throw (e.g. decrypt failure). Resolves when every user's work for this cycle is done.
  */
 export async function pollOnce(cfg: Config, db: Db, users: User[], runtimeFor: (u: User) => UserRuntime | Promise<UserRuntime>, queue: ReviewQueue = reviewQueue): Promise<void> {
-  await Promise.all(users.filter((x) => x.enabled).map((u) => pollUser(cfg, db, u, runtimeFor, queue)));
+  await Promise.all([
+    ...users.filter((x) => x.enabled).map((u) => pollUser(cfg, db, u, runtimeFor, queue)),
+    ...users.filter((x) => !x.enabled).map((u) => cleanupClones(cfg, u, queue)),
+  ]);
+  await pruneOrphans(cfg, db, queue);
+}
+
+/**
+ * Hourly clone cleanup of one user, as a job in that user's own lane (the one their reviews/triggers use), so it never
+ * overlaps a review of this user. Best-effort: never throws.
+ */
+async function cleanupClones(cfg: Config, u: User, queue: ReviewQueue): Promise<void> {
+  try {
+    if (cleanupDue(String(u.gitlabUserId))) await queue.enqueue(laneFor(engineFields(u), cfg.ownerEngineTestUsers), `clean:${u.gitlabUserId}`, async () => pruneUserClones(cfg.dataDir, u.gitlabUserId)).done;
+  } catch (e) {
+    console.error(`[cleanup] ${u.username} failed:`, (e as Error).message);
+  }
+}
+
+/**
+ * Clone cleanup of users that no longer exist in the DB (hourly; checked against the FULL DB list, so disabled, pending
+ * or per-cycle-filtered users are never orphans). A deleted user can no longer enqueue (every enqueue path looks the
+ * user up in the DB), but a job queued or running before
+ * the deletion may still run: drain the shared lane and the user's own lane (the two lanes laneFor can have used)
+ * before removing. Not called from inside a lane job, so awaiting lanes cannot deadlock. Best-effort.
+ */
+async function pruneOrphans(cfg: Config, db: Db, queue: ReviewQueue): Promise<void> {
+  try {
+    if (!cleanupDue("orphans")) return;
+    const known = new Set(listUsers(db).map((u) => u.gitlabUserId)); // the full DB list, never the per-cycle filtered one (setup mode drops OAuth users)
+    for (const id of cloneUserIds(cfg.dataDir)) {
+      if (known.has(id)) continue;
+      await queue.enqueue(SHARED_LOGIN_LANE, `clean-orphan0:${id}`, async () => {}).done;
+      await queue.enqueue(id, `clean-orphan:${id}`, async () => removeUserClones(cfg.dataDir, id)).done;
+    }
+  } catch (e) {
+    console.error("[cleanup] orphan sweep failed:", (e as Error).message);
+  }
 }
 
 async function pollUser(cfg: Config, db: Db, u: User, runtimeFor: (u: User) => UserRuntime | Promise<UserRuntime>, queue: ReviewQueue): Promise<void> {
@@ -99,6 +136,8 @@ async function pollUser(cfg: Config, db: Db, u: User, runtimeFor: (u: User) => U
     }
   } catch (e) {
     console.error(`[poll] ${u.username} failed:`, (e as Error).message);
+  } finally {
+    await cleanupClones(cfg, u, queue); // also when the poll failed early (no skill, expired token, GitLab down)
   }
 }
 
