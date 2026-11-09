@@ -126,7 +126,7 @@ jobs:
           VERSION: ${{ steps.pick.outputs.version }}
         run: gh release create "v$VERSION" --title "Argus $VERSION" --notes-file ".changes/$VERSION.md"
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         if: steps.pick.outputs.skip == 'false'
         with:
           registry: ghcr.io
