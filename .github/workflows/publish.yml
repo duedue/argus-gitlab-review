@@ -102,7 +102,10 @@ jobs:
         env:
           VERSION: ${{ steps.pick.outputs.version }}
         run: |
-          docker build -t "ghcr.io/${{ github.repository }}:$VERSION" -t "ghcr.io/${{ github.repository }}:latest" .
+          docker build \
+            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            -t "ghcr.io/${{ github.repository }}:$VERSION" -t "ghcr.io/${{ github.repository }}:latest" .
 
       - name: Fast-forward main, tag, drop the release branch
         if: steps.pick.outputs.skip == 'false'
