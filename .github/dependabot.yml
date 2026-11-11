@@ -20,6 +20,10 @@ updates:
       day: monday
       time: "09:00"
       timezone: Asia/Taipei
+    ignore:
+      # The image tracks the Node major in .nvmrc and package.json engines; bump it deliberately.
+      - dependency-name: node
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
@@ -27,3 +31,6 @@ updates:
       day: monday
       time: "09:00"
       timezone: Asia/Taipei
+    groups:
+      actions:
+        patterns: ["*"]
