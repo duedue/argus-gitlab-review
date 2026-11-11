@@ -239,6 +239,7 @@ npm run cli -- user set <username> language=en severity_threshold=major confiden
 npm run cli -- user remove <username>
 npm run poll-once                            # one cycle over all enabled users
 npm run cli -- review <project_id> <mr_iid> [--user <username>] [--head <sha>] [--engine claude-cli|codex-cli]   # always dry-run
+npm run cli -- review-branch <project> <branch> [--base <branch>] [--user <u>] [--engine ...] [--json]   # pre-MR review, prints only; host/dev aid (runs outside the queue: not beside a busy server), users should use POST /api/review-branch
 ```
 
 `user add` checks the PAT via `GET /user` and `/personal_access_tokens/self` (needs `api` scope, not expired) and stores it AES-256-GCM encrypted. Master key: Keychain item `argus`/`master-key`, fallback env `ARGUS_MASTER_KEY`; no key = refuse to run.

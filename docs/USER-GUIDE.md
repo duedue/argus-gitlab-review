@@ -102,6 +102,51 @@ Without `"self":true`, it queues reviews for every approved Argus user who is a 
 | 404 | Your GitLab account cannot see this MR |
 | 429 | Limit of 30 calls per user per hour |
 
+### Reviewing a branch before you open an MR (branch review)
+
+Recommended flow: **run a branch review on your branch, fix what it finds, then open the MR.** It uses your own Claude token and skill to review the branch's changes against a base branch and returns the result to the caller only: **it posts nothing on GitLab, does not approve, and does not write a review record**, so when you open the MR later the same commit is still reviewed as usual.
+
+The diff is computed as `merge-base..branch head` (the same as the Changes tab once the MR is open; merging new commits from the base does not inflate it). Exclusion rules, the line limit, the severity / confidence thresholds, the prompt, and the skill are the same as for MR reviews. Above the line limit nothing is reviewed and the result reports `skipped`.
+
+For normal use, call the API below. The CLI is a helper for the Argus host and for development: it does not go through the review queue, so **do not run it while the server is busy (it may be reviewing an MR)**. `--base` defaults to the project's default branch, and `--json` prints JSON:
+
+```sh
+# compose deployment
+docker compose exec argus npm run cli -- review-branch <group/project or project id> <branch> [--base <branch>] [--user <username>] [--engine <name>] [--json]
+# local deployment (from the repo checkout)
+npm run cli -- review-branch <group/project or project id> <branch> [--base <branch>] [--user <username>] [--engine <name>] [--json]
+```
+
+The API uses the same key as the trigger API and **shares the trigger API's limit of 30 calls per user per hour**; a call counts only when it actually creates a job, and polling does not count. Each person can have only 1 branch review in progress (queued or running) at a time; to review another branch, wait for the previous one to finish. A review takes 1-2 minutes, so the API is asynchronous:
+
+```sh
+# 1. Queue it; project is the full path or the numeric id, base is optional
+curl -fsS -X POST \
+  -H "Authorization: Bearer $ARGUS_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"project":"<group>/<project>","branch":"<branch>","base":"main"}' \
+  http://<argus-host>:3000/api/review-branch
+# 202 {"id":"<job id>","status":"queued","head":"<sha>","base":"main","merge_base":"<sha>"}
+
+# 2. Poll until status is done or failed
+curl -fsS -H "Authorization: Bearer $ARGUS_API_KEY" http://<argus-host>:3000/api/review-branch/<job id>
+# {"status":"done","head":...,"merge_base":...,"verdict":"request_changes","summary":...,
+#  "findings":[...],"below_threshold":[...],"lines":..,"files":[..]}   (a skipped review adds "skipped":"<reason>")
+```
+
+`findings` are the items that pass your thresholds; `below_threshold` holds the rest (an MR review puts those in the summary only). Branch names accept only alphanumerics and `. _ + - /`: names containing `@`, `#`, `~`, non-ASCII characters, or a path segment starting with `.` get 400 `invalid_branch`. On failure `status` is `failed` and `error` is `review_failed` (details only in the server log). Results are kept in memory only: they expire about 1 hour after completion, are lost when Argus restarts, and can be read only by the person who created them.
+
+| Status | Meaning |
+|---|---|
+| 202 | Accepted (if the same person already has a job queued or running for the same pair of commits, the existing job is returned) |
+| 400 | Invalid JSON is reported as `invalid_project`; otherwise `invalid_project` / `invalid_branch` / `invalid_base` (malformed), `no_skill_uploaded`, `no_review_engine`, `base_unknown` |
+| 401 | Wrong Argus API key, or your GitLab authorization expired |
+| 403 | You are not an approved user yet |
+| 404 | Your account cannot see the project, or the branch / base does not exist (`project_not_found` / `branch_not_found` / `base_not_found` / `merge_base_not_found`); on GET, the job does not exist, has expired, or is not yours |
+| 413 | Request body larger than 4 KB (`body_too_large`) |
+| 429 | `too_many_active` (you already have a branch review in progress; the response includes `active_id`, the id of that job) or `rate_limited` (the 30 creations per user per hour shared with the trigger API, or a rough cap of 120 calls per user per hour) |
+| 502 | `gitlab_error`: the GitLab lookup failed |
+
 ### Triggering automatically from your AI agent
 
 If you open MRs with an AI agent such as Claude Code or Codex, you can have it ask Argus for a review after opening an MR or pushing.
@@ -113,7 +158,7 @@ If you open MRs with an AI agent such as Claude Code or Codex, you can have it a
 ````markdown
 ## Argus automatic review
 
-After opening an MR or pushing a new commit, ask Argus to review the MR:
+Before opening an MR, you can self-review with a branch review (see the previous section) and fix what it finds. After opening an MR or pushing a new commit, ask Argus to review the MR:
 
 1. After pushing, wait about 10 seconds (GitLab needs time to update the MR), then run:
    ```sh

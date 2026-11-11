@@ -30,6 +30,7 @@ export interface Project {
   id: number;
   http_url_to_repo: string;
   path_with_namespace: string;
+  default_branch?: string;
 }
 
 export interface Discussion {
@@ -92,8 +93,19 @@ export class GitLab {
     return (await this.req<Mr>("GET", `/projects/${projectId}/merge_requests/${iid}`)).data;
   }
 
-  async getProject(id: number): Promise<Project> {
-    return (await this.req<Project>("GET", `/projects/${id}`)).data;
+  /** `id` is the numeric id or the full path (url-encoded here). */
+  async getProject(id: number | string): Promise<Project> {
+    return (await this.req<Project>("GET", `/projects/${encodeURIComponent(id)}`)).data;
+  }
+
+  /** Head commit sha of a branch (404 when it does not exist). */
+  async getBranchSha(projectId: number, branch: string): Promise<string> {
+    return (await this.req<{ commit: { id: string } }>("GET", `/projects/${projectId}/repository/branches/${encodeURIComponent(branch)}`)).data.commit.id;
+  }
+
+  /** Common ancestor of two refs (GitLab's equivalent of `git merge-base`); what an MR's diff_refs.base_sha is. */
+  async getMergeBase(projectId: number, a: string, b: string): Promise<string> {
+    return (await this.req<{ id: string }>("GET", `/projects/${projectId}/repository/merge_base?refs[]=${encodeURIComponent(a)}&refs[]=${encodeURIComponent(b)}`)).data.id;
   }
 
   listDiscussions(projectId: number, iid: number): Promise<Discussion[]> {

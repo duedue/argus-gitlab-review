@@ -20,6 +20,7 @@ import { bootstrapOwner, clearClaudeToken, engineFields, getUserById, hasOwner, 
 import { parseProjectList, reviewAllowed } from "../projects.ts";
 import { isDraft } from "../gitlab.ts";
 import { chooseEngine, laneFor } from "../engine.ts";
+import { BranchError, branchResultJson, getBranchJob, startBranchReview, validBranchName, validProjectRef } from "../branchreview.ts";
 import { makeRateLimiter, parseMrUrl, TRIGGER_LIMIT_PER_HOUR, triggerReviews, TriggerError } from "../trigger.ts";
 import { DOCS, loadDocs, type DocKey } from "./docs.ts";
 import {
@@ -35,6 +36,7 @@ export interface WebDeps {
   runtimeFor?: (u: User) => Promise<UserRuntime>;
   queue?: ReviewQueue;
   triggerLimitPerHour?: number;
+  branchAttemptsPerHour?: number;
   docsDir?: URL; // test seam: where the guides are read from
   // Test seam: one minimal `claude -p` with the pasted Claude token before it is saved (real call by default).
   verifyClaudeToken?: (u: User, token: string) => Promise<ConnectionTest>;
@@ -68,11 +70,13 @@ const NOTICES: Record<string, Notice> = {
 };
 
 export function createApp({
-  cfg, db, key, oauth, runtimeFor = runtimeFactory(cfg, db, key, oauth), queue = reviewQueue, triggerLimitPerHour = TRIGGER_LIMIT_PER_HOUR, docsDir,
+  cfg, db, key, oauth, runtimeFor = runtimeFactory(cfg, db, key, oauth), queue = reviewQueue, triggerLimitPerHour = TRIGGER_LIMIT_PER_HOUR, branchAttemptsPerHour = 120, docsDir,
   verifyClaudeToken = (u, token) => claudeTestConnection(cfg.claudeBin, u.model, { token: () => token, configDir: claudeConfigDir(cfg.dataDir, u.gitlabUserId) }),
 }: WebDeps): Hono<Env> {
   const app = new Hono<Env>();
   const triggerAllowed = makeRateLimiter(triggerLimitPerHour);
+  // Coarse ceiling on branch-review attempts: the unmetered pre-checks still cost a token decrypt + GitLab calls.
+  const branchAttemptAllowed = makeRateLimiter(branchAttemptsPerHour);
   // Engine status card: cached ~60s (each check spawns the CLI); the connection test costs a real model call, so 1 per 30s.
   const claudeStatus = ttlCache(60_000, () => claudeAuthStatus(cfg.claudeBin));
   const codexStatus = ttlCache(60_000, () => codexLoginStatus(cfg.codexBin));
@@ -377,18 +381,26 @@ export function createApp({
   });
 
   // --- trigger API: Bearer key only (no cookies, so no CSRF applies) ---
-  app.post("/api/trigger", bodyLimit({ maxSize: 4 * 1024, onError: (c) => c.json({ error: "body_too_large" }, 413) }), async (c) => {
+  // Shared by the Bearer-key API routes. `limited`: count this call against the per-user hourly budget.
+  const apiCaller = (c: Context, limited: boolean): { caller: User } | { res: Response } => {
     const bearer = /^Bearer (\S+)$/.exec(c.req.header("authorization") ?? "")?.[1];
     const hit = bearer && API_KEY_RE.test(bearer) ? findApiKey(db, bearer) : undefined;
     const caller = hit && getUserById(db, hit.userId);
-    if (!hit || !caller) return c.json({ error: "invalid_api_key" }, 401);
+    if (!hit || !caller) return { res: c.json({ error: "invalid_api_key" }, 401) };
     // Per user, not per key: regenerating a key must not reset the budget (it protects the owner's subscription).
-    if (!triggerAllowed(String(hit.userId))) {
+    if (limited && !triggerAllowed(String(hit.userId))) {
       c.header("Retry-After", "3600");
-      return c.json({ error: "rate_limited" }, 429);
+      return { res: c.json({ error: "rate_limited" }, 429) };
     }
     touchApiKey(db, hit.hash);
-    if (!caller.approved || !caller.enabled) return c.json({ error: "user_not_approved" }, 403);
+    if (!caller.approved || !caller.enabled) return { res: c.json({ error: "user_not_approved" }, 403) };
+    return { caller };
+  };
+
+  app.post("/api/trigger", bodyLimit({ maxSize: 4 * 1024, onError: (c) => c.json({ error: "body_too_large" }, 413) }), async (c) => {
+    const auth = apiCaller(c, true);
+    if ("res" in auth) return auth.res;
+    const { caller } = auth;
     const body = await c.req.json().catch(() => undefined);
     const ref = parseMrUrl((body as { mr_url?: unknown } | undefined)?.mr_url, cfg.gitlabUrl);
     if (!ref) return c.json({ error: "invalid_mr_url" }, 400);
@@ -400,6 +412,40 @@ export function createApp({
       if (e instanceof TriggerError) return c.json({ error: e.code }, e.status);
       throw e;
     }
+  });
+
+  // Pre-MR branch review: async (1-2 min). Same auth and hourly budget as /api/trigger; the budget is charged only when a job is
+  // actually created (not for rejected/deduped calls); polling GET is not counted. One active job per user.
+  // Results go only to the caller; nothing is posted to GitLab and no review-history row is written.
+  app.post("/api/review-branch", bodyLimit({ maxSize: 4 * 1024, onError: (c) => c.json({ error: "body_too_large" }, 413) }), async (c) => {
+    const auth = apiCaller(c, false);
+    if ("res" in auth) return auth.res;
+    if (!branchAttemptAllowed(String(auth.caller.gitlabUserId))) {
+      c.header("Retry-After", "3600");
+      return c.json({ error: "rate_limited" }, 429);
+    }
+    const body = (await c.req.json().catch(() => undefined)) as { project?: unknown; branch?: unknown; base?: unknown } | undefined;
+    if (!validProjectRef(body?.project)) return c.json({ error: "invalid_project" }, 400);
+    if (!validBranchName(body?.branch)) return c.json({ error: "invalid_branch" }, 400);
+    if (body?.base !== undefined && !validBranchName(body.base)) return c.json({ error: "invalid_base" }, 400);
+    try {
+      const j = await startBranchReview({ cfg, queue, runtimeFor }, auth.caller, { project: body!.project as string, branch: body!.branch as string, base: body?.base as string | undefined }, () => triggerAllowed(String(auth.caller.gitlabUserId)));
+      return c.json({ id: j.id, status: j.status, head: j.head, base: j.base, merge_base: j.mergeBase }, 202);
+    } catch (e) {
+      if (e instanceof BranchError) {
+        if (e.code === "rate_limited") c.header("Retry-After", "3600");
+        return c.json({ error: e.code, ...e.extra }, e.status);
+      }
+      throw e;
+    }
+  });
+
+  app.get("/api/review-branch/:id", (c) => {
+    const auth = apiCaller(c, false);
+    if ("res" in auth) return auth.res;
+    const j = getBranchJob(c.req.param("id"), auth.caller.gitlabUserId);
+    if (!j) return c.json({ error: "not_found" }, 404);
+    return c.json({ id: j.id, status: j.status, project: j.project, branch: j.branch, base: j.base, head: j.head, error: j.error, ...(j.result ? branchResultJson(j.result) : { merge_base: j.mergeBase }) });
   });
 
   // --- review history ---
