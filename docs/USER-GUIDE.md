@@ -104,7 +104,7 @@ Without `"self":true`, it queues reviews for every approved Argus user who is a 
 
 ### Reviewing a branch before you open an MR (branch review)
 
-Recommended flow: **run a branch review on your branch, fix what it finds, then open the MR.** It uses your own Claude token and skill to review the branch's changes against a base branch and returns the result to the caller only: **it posts nothing on GitLab, does not approve, and does not write a review record**, so when you open the MR later the same commit is still reviewed as usual.
+Recommended flow: **run a branch review on your branch, fix what it finds, then open the MR.** It uses your own Claude token and skill to review the branch's changes against a base branch and returns the result to the caller only: **it posts nothing on GitLab, does not approve, and does not write an MR review record** (branch review results are stored in their own table and do not affect MR deduplication), so when you open the MR later the same commit is still reviewed as usual.
 
 The diff is computed as `merge-base..branch head` (the same as the Changes tab once the MR is open; merging new commits from the base does not inflate it). Exclusion rules, the line limit, the severity / confidence thresholds, the prompt, and the skill are the same as for MR reviews. Above the line limit nothing is reviewed and the result reports `skipped`.
 
@@ -134,7 +134,7 @@ curl -fsS -H "Authorization: Bearer $ARGUS_API_KEY" http://<argus-host>:3000/api
 #  "findings":[...],"below_threshold":[...],"lines":..,"files":[..]}   (a skipped review adds "skipped":"<reason>")
 ```
 
-`findings` are the items that pass your thresholds; `below_threshold` holds the rest (an MR review puts those in the summary only). Branch names accept only alphanumerics and `. _ + - /`: names containing `@`, `#`, `~`, non-ASCII characters, or a path segment starting with `.` get 400 `invalid_branch`. On failure `status` is `failed` and `error` is `review_failed` (details only in the server log). Results are kept in memory only: they expire about 1 hour after completion, are lost when Argus restarts, and can be read only by the person who created them.
+`findings` are the items that pass your thresholds; `below_threshold` holds the rest (an MR review puts those in the summary only). Branch names accept only alphanumerics and `. _ + - /`: names containing `@`, `#`, `~`, non-ASCII characters, or a path segment starting with `.` get 400 `invalid_branch`. On failure `status` is `failed` and `error` is `review_failed` (details only in the server log). Results are stored in the Argus database (separate from the MR review records) and can still be fetched by job id after Argus restarts; a review that was still running at restart is marked `failed` with `error` set to `interrupted`, so submit it again. Only the person who created a review can read it.
 
 | Status | Meaning |
 |---|---|
@@ -142,10 +142,14 @@ curl -fsS -H "Authorization: Bearer $ARGUS_API_KEY" http://<argus-host>:3000/api
 | 400 | Invalid JSON is reported as `invalid_project`; otherwise `invalid_project` / `invalid_branch` / `invalid_base` (malformed), `no_skill_uploaded`, `no_review_engine`, `base_unknown` |
 | 401 | Wrong Argus API key, or your GitLab authorization expired |
 | 403 | You are not an approved user yet |
-| 404 | Your account cannot see the project, or the branch / base does not exist (`project_not_found` / `branch_not_found` / `base_not_found` / `merge_base_not_found`); on GET, the job does not exist, has expired, or is not yours |
+| 404 | Your account cannot see the project, or the branch / base does not exist (`project_not_found` / `branch_not_found` / `base_not_found` / `merge_base_not_found`); on GET, the job does not exist or is not yours |
 | 413 | Request body larger than 4 KB (`body_too_large`) |
 | 429 | `too_many_active` (you already have a branch review in progress; the response includes `active_id`, the id of that job) or `rate_limited` (the 30 creations per user per hour shared with the trigger API, or a rough cap of 120 calls per user per hour) |
 | 502 | `gitlab_error`: the GitLab lookup failed |
+
+**Results are attached when you open the MR**: when you (the MR author) open an MR and the branch's head commit already has a finished (`done`) branch review, and the MR's target branch equals the base that review used (same project), Argus does not run again. It posts the stored result as the MR's review summary instead (summary only, no inline threads; every finding, including those below your thresholds, is listed in the summary), labelled as the pre-MR branch review result and showing the branch head, merge-base and review time. This **never auto-approves** (approval stays a human decision). When you push new commits to the MR later, the new head is reviewed in the normal way. Branch reviews that failed or were skipped (`skipped`), MRs whose target differs from the base, and MRs you did not author are reviewed in the normal way.
+
+**Retention and listing**: branch review results are kept for 90 days (older finished records are purged periodically). List your own records with `GET /api/branch-reviews?limit=20` (same API key, newest first, `limit` up to 100). It returns `{"items":[{id,status,trigger,project_id,project_path,branch,base,head,merge_base,verdict,findings_count,below_threshold_count,skipped,error,created_at,finished_at}],"next":"<cursor>|null"}`; pass `before=<next>` for the next page. A single full result is still fetched with `GET /api/review-branch/<id>`.
 
 ### Triggering automatically from your AI agent
 

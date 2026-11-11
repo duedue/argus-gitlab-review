@@ -6,9 +6,9 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApiKey } from "../src/apikeys.ts";
-import { branchQueueKey, getBranchJob, resolveBranch, runBranchReview, validBranchName, validProjectRef, sweepBranchJobs } from "../src/branchreview.ts";
+import { branchQueueKey, getBranchJob, resolveBranch, runBranchReview, validBranchName, validProjectRef } from "../src/branchreview.ts";
 import { loadConfig } from "../src/config.ts";
-import { claimReview, openDb } from "../src/db.ts";
+import { activeBranchReview, claimReview, findDoneBranchReview, finishBranchReview, insertBranchReview, listBranchReviews, openDb, releaseStaleRunning, type BranchReviewRow } from "../src/db.ts";
 import type { ReviewEngine, ReviewInput } from "../src/engine.ts";
 import type { GitLab } from "../src/gitlab.ts";
 import { ReviewQueue } from "../src/queue.ts";
@@ -90,7 +90,7 @@ test("branch review never writes: GitLab write calls throw, no db row, and the r
   assert.equal(claimReview(db, { ownerId: 1, projectId: 9, mrId: 70, mrIid: 7, headSha: r.head, dryRun: false, webUrl: "u", author: "a" }), true, "same sha, MR review still runs");
   // Structural guarantee: the module has no path to the publisher or review history.
   const src = readFileSync(new URL("../src/branchreview.ts", import.meta.url), "utf8");
-  assert.ok(!/publisher|approve|claimReview|finishReview|from "\.\/db\.ts"/.test(src.replace(/^\s*\*.*$/gm, "")));
+  assert.ok(!/publisher|approve|claimReview|finishReview/.test(src.replace(/^\s*\*.*$/gm, "")));
 });
 
 test("branch review: explicit base, skip reasons, validators", async () => {
@@ -180,17 +180,59 @@ test("api: one active job per user; a rejected call does not use the budget", as
   await t.queue.idle();
 });
 
-test("sweep never drops queued/running jobs; finished ones expire from finishedAt; failure detail is not exposed", async () => {
+test("persistence: GET reads the db (survives a new app), row is complete, MR reviews table untouched", async () => {
   const t = api();
   const { id } = (await (await t.post({ project: "g/p", branch: "feat" })).json()) as { id: string };
-  sweepBranchJobs(Date.now() + 10 * 3_600_000, 1, 0); // way past the TTL and over the cap
-  assert.equal((await t.get(id)).status, 200, "active job survives");
+  assert.match(((await (await t.get(id)).json()) as { status: string }).status, /^(queued|running)$/);
   await t.queue.idle();
-  sweepBranchJobs(Date.now(), 3_600_000, 200);
-  assert.equal((await t.get(id)).status, 200, "fresh finished job kept");
-  sweepBranchJobs(Date.now() + 2 * 3_600_000);
-  assert.equal((await t.get(id)).status, 404, "expired from finishedAt");
-  assert.equal(getBranchJob(id, 1), undefined);
+  const row = t.db.prepare(`SELECT * FROM branch_reviews WHERE id=?`).get(id) as BranchReviewRow;
+  assert.equal(row.status, "done");
+  assert.equal(row.trigger, "api");
+  assert.equal(row.project_path, "g/p");
+  assert.equal(row.project_id, 9);
+  assert.equal(row.head_sha, t.r.head);
+  assert.equal(row.verdict, "request_changes");
+  assert.ok(row.finished_at);
+  const stored = JSON.parse(row.findings_json!) as { findings: unknown[]; belowThreshold: unknown[] };
+  assert.equal(stored.findings.length, 1);
+  assert.equal(stored.belowThreshold.length, 1, "below-threshold findings are kept");
+  const body = (await (await t.get(id)).json()) as { findings: unknown[]; below_threshold: unknown[]; merge_base: string; project: string };
+  assert.equal(body.below_threshold.length, 1);
+  assert.equal(body.merge_base, t.r.m1);
+  assert.equal(body.project, "9");
+  assert.equal((t.db.prepare(`SELECT COUNT(*) n FROM reviews`).get() as { n: number }).n, 0);
+  // a restart marks leftover active rows failed (only those), finished rows stay
+  insertBranchReview(t.db, { id: "stuck", owner_id: 1, project_id: 9, project_path: "g/p", branch: "x", base: "main", merge_base: "m", head_sha: "h", trigger: "api" });
+  releaseStaleRunning(t.db);
+  assert.equal((t.db.prepare(`SELECT status, error FROM branch_reviews WHERE id='stuck'`).get() as { status: string; error: string }).error, "interrupted");
+  assert.equal(getBranchJob(t.db, id, 1)?.status, "done");
+  assert.equal(getBranchJob(t.db, id, 2), undefined, "other owner");
+  assert.equal(activeBranchReview(t.db, 1), undefined);
+});
+
+test("query helpers: newest-first keyset pagination, owner scoped; find done by (owner, project, head)", () => {
+  const db = openDb(":memory:");
+  const mk = (id: string, owner: number, head: string, at: number, status: "done" | "failed" = "done") => {
+    insertBranchReview(db, { id, owner_id: owner, project_id: 9, project_path: "g/p", branch: "b", base: "main", merge_base: "m", head_sha: head, trigger: "push" });
+    db.prepare(`UPDATE branch_reviews SET created_at=?, status=? WHERE id=?`).run(at, status, id);
+  };
+  mk("a", 1, "h1", 100); mk("b", 1, "h2", 200); mk("c", 1, "h2", 200); mk("d", 1, "h3", 300, "failed"); mk("x", 2, "h1", 400);
+  assert.deepEqual(listBranchReviews(db, 1).map((r) => r.id), ["d", "c", "b", "a"]);
+  const p1 = listBranchReviews(db, 1, { limit: 2 });
+  assert.deepEqual(p1.map((r) => r.id), ["d", "c"]);
+  const last = p1[1]!;
+  assert.deepEqual(listBranchReviews(db, 1, { limit: 2, before: { createdAt: last.created_at, id: last.id } }).map((r) => r.id), ["b", "a"]);
+  assert.equal(findDoneBranchReview(db, 1, 9, "h2")?.id, "c", "latest of equal time by id");
+  assert.equal(findDoneBranchReview(db, 1, 9, "h3"), undefined, "failed is not done");
+  assert.equal(findDoneBranchReview(db, 2, 9, "h2"), undefined, "owner scoped");
+  assert.equal(findDoneBranchReview(db, 1, 8, "h1"), undefined, "project scoped");
+});
+
+test("branch_reviews is independent of the MR dedupe: claiming the same head still works", () => {
+  const db = openDb(":memory:");
+  insertBranchReview(db, { id: "j", owner_id: 1, project_id: 9, project_path: "g/p", branch: "b", base: "main", merge_base: "m", head_sha: "h1", trigger: "api" });
+  finishBranchReview(db, "j", { verdict: "approve", findingsJson: "{}" });
+  assert.ok(claimReview(db, { ownerId: 1, projectId: 9, mrId: 5, mrIid: 1, headSha: "h1", dryRun: false }), "MR claim for the same sha is unaffected");
 });
 
 test("api: engine failure returns generic review_failed", async () => {

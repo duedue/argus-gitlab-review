@@ -20,6 +20,7 @@ import { bootstrapOwner, clearClaudeToken, engineFields, getUserById, hasOwner, 
 import { parseProjectList, reviewAllowed } from "../projects.ts";
 import { isDraft } from "../gitlab.ts";
 import { chooseEngine, laneFor } from "../engine.ts";
+import { listBranchReviews } from "../db.ts";
 import { BranchError, branchResultJson, getBranchJob, startBranchReview, validBranchName, validProjectRef } from "../branchreview.ts";
 import { makeRateLimiter, parseMrUrl, TRIGGER_LIMIT_PER_HOUR, triggerReviews, TriggerError } from "../trigger.ts";
 import { DOCS, loadDocs, type DocKey } from "./docs.ts";
@@ -429,7 +430,7 @@ export function createApp({
     if (!validBranchName(body?.branch)) return c.json({ error: "invalid_branch" }, 400);
     if (body?.base !== undefined && !validBranchName(body.base)) return c.json({ error: "invalid_base" }, 400);
     try {
-      const j = await startBranchReview({ cfg, queue, runtimeFor }, auth.caller, { project: body!.project as string, branch: body!.branch as string, base: body?.base as string | undefined }, () => triggerAllowed(String(auth.caller.gitlabUserId)));
+      const j = await startBranchReview({ cfg, db, queue, runtimeFor }, auth.caller, { project: body!.project as string, branch: body!.branch as string, base: body?.base as string | undefined }, () => triggerAllowed(String(auth.caller.gitlabUserId)));
       return c.json({ id: j.id, status: j.status, head: j.head, base: j.base, merge_base: j.mergeBase }, 202);
     } catch (e) {
       if (e instanceof BranchError) {
@@ -443,9 +444,33 @@ export function createApp({
   app.get("/api/review-branch/:id", (c) => {
     const auth = apiCaller(c, false);
     if ("res" in auth) return auth.res;
-    const j = getBranchJob(c.req.param("id"), auth.caller.gitlabUserId);
+    const j = getBranchJob(db, c.req.param("id"), auth.caller.gitlabUserId);
     if (!j) return c.json({ error: "not_found" }, 404);
     return c.json({ id: j.id, status: j.status, project: j.project, branch: j.branch, base: j.base, head: j.head, error: j.error, ...(j.result ? branchResultJson(j.result) : { merge_base: j.mergeBase }) });
+  });
+
+  // The caller's stored branch reviews, newest first. `next` is the opaque cursor for the following page (null at the end).
+  app.get("/api/branch-reviews", (c) => {
+    const auth = apiCaller(c, false);
+    if ("res" in auth) return auth.res;
+    const limit = Math.min(Math.max(Number(c.req.query("limit")) || 20, 1), 100);
+    const cur = c.req.query("before");
+    const m = cur === undefined ? null : /^(\d{1,16}):([0-9a-f-]{36})$/.exec(cur);
+    if (cur !== undefined && !m) return c.json({ error: "invalid_cursor" }, 400);
+    const rows = listBranchReviews(db, auth.caller.gitlabUserId, { limit: limit + 1, before: m ? { createdAt: Number(m[1]), id: m[2]! } : undefined });
+    const page = rows.slice(0, limit);
+    const last = page[page.length - 1];
+    return c.json({
+      items: page.map((r) => {
+        const stored = r.findings_json ? (JSON.parse(r.findings_json) as { findings: unknown[]; belowThreshold: unknown[]; skipped?: string }) : undefined;
+        return {
+          id: r.id, status: r.status, trigger: r.trigger, project_id: r.project_id, project_path: r.project_path, branch: r.branch, base: r.base, head: r.head_sha,
+          merge_base: r.merge_base, verdict: r.verdict, findings_count: stored?.findings.length ?? null, below_threshold_count: stored?.belowThreshold.length ?? null,
+          skipped: stored?.skipped ?? null, error: r.error, created_at: r.created_at, finished_at: r.finished_at,
+        };
+      }),
+      next: rows.length > limit && last ? `${last.created_at}:${last.id}` : null,
+    });
   });
 
   // --- review history ---

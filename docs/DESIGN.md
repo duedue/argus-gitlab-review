@@ -41,6 +41,30 @@ Self-hosted multi-user GitLab AI code review platform. Each user imports their G
 | Stack | TypeScript full-stack + SQLite, shipped as a Docker image run by Docker Compose |
 | Deploy | Two modes (`ARGUS_DEPLOY`, explicit, never inferred): `compose` (set by `docker-compose.yml`; operator commands shown in the UI are `docker compose ...`) and `local` (developer, commands run directly). Unknown values fall back to `local` with a warning. `GITLAB_URL` is required (no default) and checked at startup; `JIRA_URL` is optional (unset = Jira context off). |
 
+## Branch review history (design)
+
+Three parts, shipped in this order: persist (A), attach to the MR on open (B), push-triggered auto review (C). A and B are implemented; C is design only.
+
+**Data model.** New table `branch_reviews` (additive `CREATE TABLE IF NOT EXISTS`, no change to existing tables): `id TEXT PK` (the job uuid, so the API id is unchanged), `owner_id`, `project_id`, `project_path`, `branch`, `base`, `merge_base`, `head_sha`, `status` (`queued|running|done|failed`), `verdict`, `findings_json` (`{findings, belowThreshold, lines, files, model, skipped}`), `summary`, `error`, `trigger` (`api|cli|push`), `created_at`, `finished_at` (epoch ms). Indexes: `(owner_id, created_at)` for the list, `(owner_id, project_id, head_sha)` for lookup.
+
+**Separation from `reviews`.** `reviews` UNIQUE(owner_id, mr_id, head_sha, dry_run) is the MR claim/dedupe, keyed by an MR id a branch does not have yet. `branch_reviews` has its own table and its own dedupe, and `branchreview.ts` still imports no publisher and no claim functions. The only bridge is B, which reads `branch_reviews` and then writes a normal `reviews` row through the existing claim path.
+
+| Part | Behaviour |
+|---|---|
+| A Persist | The API job store is the table. POST inserts `queued`, the queue callback updates to `running`/`done`/`failed`. GET reads the row (owner-scoped; other users get 404). One active job per user = a `queued|running` row of the owner. Startup marks leftover `queued|running` rows `failed` (`interrupted`), since the in-memory queue is gone. Helpers: `listBranchReviews(owner, {limit, before})` newest first with keyset pagination, and `findDoneBranchReview(owner, project_id, head_sha)`. CLI runs (not queued) are recorded with `trigger='cli'`. Retention: none yet (open question 1). |
+| B Attach on MR open | In the poll path, when the MR author is the owner and `findDoneBranchReview(owner, project_id, head_sha)` exists (not `skipped`), post the stored result with the normal summary renderer, headed "Pre-MR review (branch review, not re-run)", then record the `reviews` row as `done` (findings copied) so the SHA is never re-reviewed. Summary only: inline positions come from a merge-base diff that may differ from the MR diff version. One lookup in the claim-holder branch of `reviewMr`; if it needs more than that hook (claim/retry/round counting), stop and redesign. |
+| C Push-triggered | `users.review_pushed_branches` (default 0, explicit opt-in, additive column). A poller step reads the user's GitLab push events (`/users/:id/events?action=pushed`) since a cursor kept in `settings`, keeps branch pushes, drops the default branch and branches with an open MR (`merge_requests?source_branch=`), applies the project allowlist used for auto triggers, dedupes on `findDoneBranchReview` or an in-flight row for (owner, project, head_sha), then enqueues with `trigger='push'` in the user's lane. Results are only stored; nothing is written to GitLab. |
+
+**B, concrete hook (implemented with these decisions: summary only, never feeds auto-approve, match = owner + project + head SHA + MR target == branch review base, done only; retention 90 days via the hourly orphan-sweep cadence; `users.branch_daily_cap` default 20 and 5-minute push debounce are decided for C).** In `reviewMr` (`src/review.ts`), after `claimReview` and the `diff_refs` wait, replace the `prepareDiff` + `engine.review` section with the stored result when `mr.author.id == me` and `findDoneBranchReview(db, me, s.project_id, mr.sha)` hits. Everything after (`publish`, `resolveThreads`, `finish(..."done")`, `syncApproval`) can then run unchanged, so the SHA is recorded in `reviews` and never re-reviewed. This was NOT done in A because it is more than a small hook: (1) `publish` has no "pre-MR" label, so `ctx` and the summary renderer need a new field; (2) `publish` would post inline threads at positions computed against the branch-review merge-base diff, so it needs a summary-only switch; (3) `syncApproval` would auto-approve from a pre-MR verdict unless gated (open question 2); (4) the retry/round counters assume a real engine pass. Do (1)-(3) as one MR with its own tests.
+
+**Open questions**
+1. Retention of `branch_reviews`: forever, 90-day sweep, or per-user cap?
+2. B: summary only (proposed) or also inline threads? Should a pre-MR verdict feed auto-approve, or is auto-approve always re-evaluated?
+3. B: match on head SHA only, or also require MR target branch == branch review base?
+4. C: events API polling cost vs. a webhook (needs Premium, edition unknown); per-user daily cap to protect the Claude token quota?
+5. C: force-pushed or rapidly pushed branch: review every SHA or debounce (e.g. 10 min quiet)?
+6. Stored findings go stale when the branch moves: UI shows stored head_sha vs. current head, no automatic invalidation.
+
 ## Open items
 
 - (resolved 0.2.0) Multi-user rollout uses per-user Claude tokens (`claude setup-token`) instead of a shared provider API key
