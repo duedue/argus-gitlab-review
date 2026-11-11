@@ -571,6 +571,14 @@ export function listBranchReviews(db: Db, ownerId: number, opts: { limit?: numbe
     .all(...(b ? [ownerId, b.createdAt, b.createdAt, b.id, limit] : [ownerId, limit])) as BranchReviewRow[];
 }
 
+/** One branch review by id, any owner (callers enforce access). */
+export const getBranchReviewById = (db: Db, id: string): BranchReviewRow | undefined =>
+  db.prepare(`SELECT * FROM branch_reviews WHERE id=?`).get(id) as BranchReviewRow | undefined;
+
+/** The MR review row created for the same owner/project/commit (a branch review attached on MR open), newest first. */
+export const findAttachedMr = (db: Db, ownerId: number, projectId: number, headSha: string): { mr_iid: number; mr_url: string | null } | undefined =>
+  db.prepare(`SELECT mr_iid, mr_url FROM reviews WHERE owner_id=? AND project_id=? AND head_sha=? ORDER BY id DESC LIMIT 1`).get(ownerId, projectId, headSha) as { mr_iid: number; mr_url: string | null } | undefined;
+
 export const BRANCH_REVIEW_RETENTION_MS = 90 * 24 * 3_600_000;
 /** Deletes finished branch reviews older than the retention window (queued/running rows are never touched). Returns the count. */
 export const pruneBranchReviews = (db: Db, now = Date.now()): number =>

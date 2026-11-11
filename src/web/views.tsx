@@ -1,6 +1,6 @@
 import { html, raw } from "hono/html";
 import type { SkillWarning } from "../skills.ts";
-import { SEVERITIES } from "../findings.ts";
+import { SEVERITIES, type Finding } from "../findings.ts";
 import type { ApiKeyInfo } from "../apikeys.ts";
 import type { ClaudeAuth, CodexAuth, ConnectionTest } from "../engine-status.ts";
 import type { OperatorCommands } from "../commands.ts";
@@ -408,6 +408,15 @@ export function SettingsPage(p: SettingsView) {
             <p class="help" id="max_diff_lines_help">超過此行數（新增＋刪除，已排除 lock、翻譯、產生檔）的 MR 只會收到「請拆分」留言，不做審查。留空使用預設 {p.defaultMaxDiffLines}。上限越大，越容易漏看問題，也越容易逾時（審查時限會隨行數放寬，最長 15 分鐘）；用量計入你自己的訂閱。</p>
           </div>
           <div class="field">
+            <label for="review_pushed_branches" class="check"><input id="review_pushed_branches" type="checkbox" name="review_pushed_branches" value="1" checked={u.reviewPushedBranches} aria-describedby="review_pushed_branches_help" /> <span>自動審查我 push 的 branch（尚未開 MR 者）</span></label>
+            <p class="help help-check" id="review_pushed_branches_help">最後一次 push 後約 5 分鐘開始審查；會略過預設 branch 與已有開啟中 MR 的 branch，並遵守「自動審查的專案」清單。每日次數計入下方上限（滾動 24 小時，只計 push 觸發的）。結果顯示在審查紀錄的「Branch 審查」分頁，之後開 MR 時會貼到該 MR 的審查摘要。預設關閉。</p>
+          </div>
+          <div class="field">
+            <label for="branch_daily_cap">每日自動 branch 審查上限（0–1000，0 = 關閉）</label>
+            <input id="branch_daily_cap" type="number" name="branch_daily_cap" min="0" max="1000" step="1" value={u.branchDailyCap} aria-describedby="branch_daily_cap_help" />
+            <p class="help" id="branch_daily_cap_help">屬於上方「自動審查我 push 的 branch」：限制 24 小時內由 push 自動觸發的 branch 審查次數，避免耗盡你的 Claude 額度；預設 20，0 = 不自動審。未勾選上方選項時此值仍會儲存，但不會生效。手動（API／CLI）執行不受此限。</p>
+          </div>
+          <div class="field">
             <label for="review_all_projects" class="check"><input id="review_all_projects" type="checkbox" name="review_all_projects" value="1" checked={u.reviewAllProjects} aria-describedby="review_all_projects_help" /> <span>允許所有被指派的 MR</span></label>
             <p class="help help-check" id="review_all_projects_help">勾選後，指派給你的 MR 不論專案都會自動審查，上方清單暫時不再限制（清單內容會保留，取消勾選後恢復限制）。作者自我審查不受影響。預設關閉。</p>
           </div>
@@ -532,13 +541,129 @@ function ErrorText(p: { r: ReviewRow }) {
     : r.error ? <span title={r.error}>{r.error.length > 80 ? `${r.error.slice(0, 80)}…` : r.error}</span> : null;
 }
 
-export function ReviewsPage(p: { user: User; csrf: string; rows: ReviewRow[]; pending?: SeenMr[]; notice?: Notice }) {
+export interface BranchRowView {
+  id: string; createdAt: number; project: string; projectUrl: string; branch: string; base: string; mergeBase: string; head: string;
+  verdict: string | null; findings: number | null; below: number | null; trigger: string; status: string; error: string | null; skipped: string | null;
+  mr?: { iid: number; url: string | null };
+}
+
+const VERDICT_LABEL: Record<string, string> = { approve: "可合併", request_changes: "建議修改", needs_discussion: "需討論" };
+const VERDICT_KIND: Record<string, string> = { approve: "done", request_changes: "failed", needs_discussion: "warn" };
+const BRANCH_STATUS: Record<string, string> = { queued: "排隊中", running: "執行中", done: "完成", failed: "失敗" };
+const TRIGGER_LABEL: Record<string, string> = { api: "API", cli: "CLI", push: "push" };
+const formatMs = (ms: number) => formatTaipei(new Date(ms).toISOString().slice(0, 19).replace("T", " "));
+const compareUrl = (r: { projectUrl: string; mergeBase: string; head: string }) => `${r.projectUrl}/-/compare/${r.mergeBase}...${r.head}`;
+
+const VerdictBadge = (p: { v: string | null }) => (p.v && VERDICT_LABEL[p.v] ? <Badge kind={VERDICT_KIND[p.v]!}>{VERDICT_LABEL[p.v]}</Badge> : <span class="muted" aria-label="無結論">—</span>);
+
+function BranchTab(p: { rows: BranchRowView[]; next: string | null }) {
+  if (p.rows.length === 0) {
+    return <p class="empty">尚無 branch 審查紀錄。開 MR 前可先對 branch 跑一次審查（API 或 CLI），結果會顯示在這裡；做法見<a href="/docs/guide">使用指南</a>「開 MR 之前先審 branch」一節。</p>;
+  }
+  return (
+    <>
+      <p class="muted">依時間由新到舊，時間為 Asia/Taipei；紀錄保存 90 天。點時間看完整結果。</p>
+      <div class="table-wrap" role="region" aria-label="Branch 審查列表" tabindex={0}>
+        <table class="reviews">
+          <thead>
+            <tr><th scope="col">時間</th><th scope="col">專案</th><th scope="col">Branch</th><th scope="col">Head</th><th scope="col">結論</th><th scope="col" class="num">Findings</th><th scope="col">觸發方式</th><th scope="col">狀態</th><th scope="col">MR</th></tr>
+          </thead>
+          <tbody>
+            {p.rows.map((r) => (
+              <tr>
+                <td class="nowrap"><a href={`/reviews/branch/${r.id}`}>{formatMs(r.createdAt)}</a></td>
+                <td><code>{r.project}</code></td>
+                <td>
+                  <a href={compareUrl(r)} target="_blank" rel="noopener noreferrer">{r.branch} → {r.base}<span class="sr-only">（GitLab 比較頁，另開新分頁）</span></a>
+                </td>
+                <td><code>{r.head.slice(0, 8)}</code></td>
+                <td class="nowrap"><VerdictBadge v={r.verdict} /></td>
+                <td class="num nowrap">
+                  {r.findings === null ? "" : r.findings}
+                  {r.below ? <span class="muted"> (+{r.below})<span class="sr-only"> 低於門檻</span></span> : null}
+                </td>
+                <td class="nowrap">{TRIGGER_LABEL[r.trigger] ?? r.trigger}</td>
+                <td class="nowrap">
+                  <Badge kind={r.status === "queued" ? "running" : r.status}>{BRANCH_STATUS[r.status] ?? r.status}</Badge>
+                  {r.skipped && <span class="muted"> {r.skipped}</span>}
+                  {r.error && <> <span class="err-cell" title={r.error}>{r.error.length > 40 ? `${r.error.slice(0, 40)}…` : r.error}</span></>}
+                </td>
+                <td class="nowrap">
+                  {r.mr ? (r.mr.url ? <a href={r.mr.url} target="_blank" rel="noopener noreferrer">→ !{r.mr.iid}<span class="sr-only">（另開新分頁）</span></a> : `→ !${r.mr.iid}`) : <span class="muted" aria-label="未對應 MR">—</span>}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {p.next && <p class="pager"><a href={`/reviews?tab=branch&before=${encodeURIComponent(p.next)}`}>下一頁（較舊）</a></p>}
+    </>
+  );
+}
+
+function FindingList(p: { items: Finding[] }) {
+  return (
+    <ul class="findings">
+      {p.items.map((f) => (
+        <li>
+          <p><Badge kind={f.severity === "blocker" || f.severity === "major" ? "failed" : f.severity === "minor" ? "warn" : "skipped"}>{f.severity}</Badge> <strong>{f.title}</strong></p>
+          <p class="muted"><code>{f.file}{f.line ? `:${f.line}` : ""}</code>・信心 {Math.round(f.confidence * 100)}%</p>
+          <p class="f-body">{f.body}</p>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+export function BranchReviewPage(p: { user: User; csrf: string; r: BranchRowView; summary: string | null; findings: Finding[]; below: Finding[]; ownerName?: string }) {
+  const r = p.r;
+  return (
+    <Layout title="Branch 審查" user={p.user} csrf={p.csrf} nav="reviews">
+      <p><a href="/reviews?tab=branch">← 回審查紀錄</a></p>
+      <h2>Branch 審查</h2>
+      <section class="card" aria-labelledby="bd-meta">
+        <h3 id="bd-meta">{r.project}</h3>
+        <dl class="kv">
+          <dt>Branch</dt><dd><a href={compareUrl(r)} target="_blank" rel="noopener noreferrer">{r.branch} → {r.base}<span class="sr-only">（GitLab 比較頁，另開新分頁）</span></a></dd>
+          <dt>Head</dt><dd><code>{r.head.slice(0, 8)}</code>（merge-base <code>{r.mergeBase.slice(0, 8)}</code>）</dd>
+          <dt>時間</dt><dd>{formatMs(r.createdAt)}・{TRIGGER_LABEL[r.trigger] ?? r.trigger}{p.ownerName && `・${p.ownerName}`}</dd>
+          <dt>狀態</dt><dd><Badge kind={r.status === "queued" ? "running" : r.status}>{BRANCH_STATUS[r.status] ?? r.status}</Badge> <VerdictBadge v={r.verdict} />{r.skipped && <span class="muted"> {r.skipped}</span>}</dd>
+          {r.mr && <><dt>MR</dt><dd>{r.mr.url ? <a href={r.mr.url} target="_blank" rel="noopener noreferrer">→ !{r.mr.iid}<span class="sr-only">（另開新分頁）</span></a> : `→ !${r.mr.iid}`}</dd></>}
+        </dl>
+        {r.error && <p class="callout callout-error" role="alert">{r.error}</p>}
+        {p.summary && <p>{p.summary}</p>}
+      </section>
+      {r.status === "done" && (
+        <>
+          <h3>Findings（{p.findings.length}）</h3>
+          {p.findings.length ? <FindingList items={p.findings} /> : <p class="empty">未發現需要回報的問題。</p>}
+          {p.below.length > 0 && (
+            <details class="below">
+              <summary>低於門檻的項目（{p.below.length}）</summary>
+              <FindingList items={p.below} />
+            </details>
+          )}
+        </>
+      )}
+    </Layout>
+  );
+}
+
+export function ReviewsPage(p: { user: User; csrf: string; rows: ReviewRow[]; pending?: SeenMr[]; notice?: Notice; tab?: "mr" | "branch"; branch?: { rows: BranchRowView[]; next: string | null } }) {
   const groups = groupReviews(p.rows);
+  const branchTab = p.tab === "branch" && !!p.branch;
   return (
     <Layout title="審查紀錄" user={p.user} csrf={p.csrf} nav="reviews">
       <h2>審查紀錄</h2>
+      <nav aria-label="審查類型">
+        <ul class="tabs">
+          <li><a href="/reviews" aria-current={branchTab ? undefined : "page"}>MR 審查</a></li>
+          <li><a href="/reviews?tab=branch" aria-current={branchTab ? "page" : undefined}>Branch 審查</a></li>
+        </ul>
+      </nav>
       {p.notice && <p class={`callout ${p.notice.warn ? "callout-warn" : "callout-ok"}`} role="status">{p.notice.text}</p>}
-      {p.pending && p.pending.length > 0 && (
+      {branchTab && <BranchTab rows={p.branch!.rows} next={p.branch!.next} />}
+      {!branchTab && p.pending && p.pending.length > 0 && (
         <section class="card pending-mrs" aria-labelledby="pending-mrs-h">
           <h3 id="pending-mrs-h">待你決定的 MR（{p.pending.length}）</h3>
           <div class="help">
@@ -574,7 +699,7 @@ export function ReviewsPage(p: { user: User; csrf: string; rows: ReviewRow[]; pe
           </ul>
         </section>
       )}
-      {p.rows.length === 0 ? (
+      {branchTab ? null : p.rows.length === 0 ? (
         <p class="empty">尚無審查紀錄。有 MR 指派你擔任 reviewer 後，結果會顯示在這裡。</p>
       ) : (
         <>
