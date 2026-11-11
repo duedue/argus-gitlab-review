@@ -114,6 +114,20 @@ export function storedSummary(json: string | null): { findings_count: number | n
   }
 }
 
+/**
+ * Title for a branch review. Branch names carry the ticket key in lower case (`fix/proj-720-x`), but Jira keys
+ * are upper case and extractIssueKeys only matches upper case, so a branch review never found its ticket. A key is
+ * taken only where the convention puts it: at the start of a path segment (`fix/<key>-...`, or a bare `<key>-...`),
+ * matched case-insensitively and appended in upper case. Words further into a segment (`feat/upgrade-node-22`) are
+ * not keys, so they cannot pull unrelated issues or crowd out the real one (MAX_ISSUES). A key followed by `.` or a
+ * letter/digit is skipped (`history-0.13.5` is a version); `_` may follow (`proj-720_add`). Known limit: a
+ * segment that merely starts key-shaped (`fix/api-2-timeout`) is still taken; Jira then finds no such issue.
+ */
+export function branchReviewTitle(branch: string, base: string): string {
+  const keys = [...new Set([...branch.matchAll(/(?:^|\/)([a-z][a-z0-9]+-\d+)(?![A-Za-z0-9.])/gi)].map((m) => m[1]!.toUpperCase()))];
+  return `Branch ${branch} (pre-MR review against ${base})${keys.length ? ` [${keys.join("] [")}]` : ""}`;
+}
+
 /** Runs the review of an already-resolved target. Writes nothing to GitLab or the database. */
 export async function runBranchReview(cfg: Config, user: User, rt: UserRuntime, t: BranchTarget, r: Resolved): Promise<BranchResult> {
   const engine = rt.engine;
@@ -127,7 +141,7 @@ export async function runBranchReview(cfg: Config, user: User, rt: UserRuntime, 
   if (!prep.diff.trim()) return { ...out, skipped: "no reviewable changes" };
   if (prep.lines > maxLines) return { ...out, skipped: `diff too large (${prep.lines} > ${maxLines} lines)` };
 
-  const title = `Branch ${t.branch} (pre-MR review against ${r.base})`;
+  const title = branchReviewTitle(t.branch, r.base);
   const requirements = await (rt.requirements ?? fetchRequirements)(cfg, title, "").catch(() => undefined);
   const result = await engine.review({
     timeoutMs: reviewTimeoutMs(prep.lines), cwd: prep.dir, mrTitle: title, mrDescription: "", diff: prep.diff, incremental: false,

@@ -6,7 +6,8 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApiKey } from "../src/apikeys.ts";
-import { branchQueueKey, criteriaFor, getBranchJob, resolveBranch, runBranchReview, validBranchName, validProjectRef } from "../src/branchreview.ts";
+import { extractIssueKeys } from "../src/jira.ts";
+import { branchQueueKey, branchReviewTitle, criteriaFor, getBranchJob, resolveBranch, runBranchReview, validBranchName, validProjectRef } from "../src/branchreview.ts";
 import { loadConfig } from "../src/config.ts";
 import { activeBranchReview, claimReview, failStaleCliBranchReviews, findDoneBranchReview, finishBranchReview, insertBranchReview, listBranchReviews, openDb, releaseStaleRunning, type BranchReviewRow } from "../src/db.ts";
 import type { ReviewEngine, ReviewInput } from "../src/engine.ts";
@@ -651,4 +652,27 @@ test("status: skill_from never reports pending_push (the push trigger only revie
   t.push(t.r.head, Date.now() - 60_000);
   assert.equal((await t.json()).advice, "pending_push");
   assert.equal((await t.json(`${t.q}&skill_from=reviewer1`)).advice, "submit");
+});
+
+test("branchReviewTitle: lower-case ticket keys in the branch name are appended in upper case; versions are not keys", async () => {
+  assert.equal(branchReviewTitle("fix/proj-720-payload-no-tests", "main"), "Branch fix/proj-720-payload-no-tests (pre-MR review against main) [PROJ-720]");
+  assert.equal(branchReviewTitle("docs/PROJ-7-x", "main"), "Branch docs/PROJ-7-x (pre-MR review against main) [PROJ-7]");
+  assert.equal(branchReviewTitle("docs/version-history-0.13.5", "main"), "Branch docs/version-history-0.13.5 (pre-MR review against main)");
+  assert.equal(branchReviewTitle("feat/skill-from", "main"), "Branch feat/skill-from (pre-MR review against main)");
+  // only at the start of a path segment: ordinary words further in are not keys
+  for (const b of ["feat/upgrade-node-22", "chore/bump-python3-12", "fix/retry-step-2"]) assert.equal(branchReviewTitle(b, "main"), `Branch ${b} (pre-MR review against main)`, b);
+  assert.equal(branchReviewTitle("feature/proj-720_add-tests", "main"), "Branch feature/proj-720_add-tests (pre-MR review against main) [PROJ-720]", "_ may follow the key");
+  // known limit: a key-shaped segment start is taken (it cannot be told apart from a ticket key); Jira just finds no such issue
+  assert.equal(branchReviewTitle("fix/api-2-timeout", "main"), "Branch fix/api-2-timeout (pre-MR review against main) [API-2]");
+  assert.equal(branchReviewTitle("proj-5-x", "main"), "Branch proj-5-x (pre-MR review against main) [PROJ-5]", "bare branch");
+  assert.deepEqual(extractIssueKeys(branchReviewTitle("fix/proj-720-a/proj-721-b", "main")), ["PROJ-720", "PROJ-721"], "what fetchRequirements sees");
+  // end to end: the requirements lookup gets a title from which the ticket key is extracted
+  const r = repo();
+  const { cfg, user } = setup();
+  const titles: string[] = [];
+  const rt = { ...mkRt(r, []), requirements: async (_c: unknown, title: string) => (titles.push(title), undefined) } as UserRuntime;
+  // the SHAs come from "feat"; only the branch name in the target carries the key
+  await runBranchReview(cfg, user, rt, { project: "g/p", branch: "fix/proj-9-x" }, await resolveBranch(rt, { project: "g/p", branch: "feat" }));
+  assert.equal(titles.length, 1);
+  assert.deepEqual(extractIssueKeys(titles[0]!), ["PROJ-9"]);
 });
