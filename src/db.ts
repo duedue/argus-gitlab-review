@@ -46,6 +46,16 @@ export function openDb(path: string): Db {
       created_at INTEGER NOT NULL,          -- epoch ms
       finished_at INTEGER
     );
+    -- Latest push seen per (owner, project, branch) for the push trigger's debounce; handled_sha = last head acted on.
+    CREATE TABLE IF NOT EXISTS pushed_branches (
+      owner_id INTEGER NOT NULL,
+      project_id INTEGER NOT NULL,
+      branch TEXT NOT NULL,
+      head_sha TEXT NOT NULL,
+      pushed_at INTEGER NOT NULL,           -- epoch ms of the push event
+      handled_sha TEXT,
+      PRIMARY KEY (owner_id, project_id, branch)
+    );
     CREATE INDEX IF NOT EXISTS idx_branch_reviews_owner ON branch_reviews (owner_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_branch_reviews_head ON branch_reviews (owner_id, project_id, head_sha);
     CREATE TABLE IF NOT EXISTS users (
@@ -163,7 +173,8 @@ function addMissingColumns(db: Db): void {
       ["token_invalid", "INTEGER NOT NULL DEFAULT 0"],
       ["approved", "INTEGER NOT NULL DEFAULT 1"],
       ["auto_approve", "INTEGER NOT NULL DEFAULT 0"], // opt-in: Argus approves clean MRs under the user's name
-      ["branch_daily_cap", "INTEGER NOT NULL DEFAULT 20"], // max push-triggered branch reviews per day (push trigger not built yet; the settings field comes with it)
+      ["branch_daily_cap", "INTEGER NOT NULL DEFAULT 20"], // max push-triggered branch reviews per rolling 24h; 0 = push trigger off
+      ["review_pushed_branches", "INTEGER NOT NULL DEFAULT 0"], // opt-in: review the user's pushed branches that have no MR yet
       ["review_assigned", "INTEGER NOT NULL DEFAULT 0"], // opt-in: also poll MRs where the user is the assignee (not only reviewer)
       ["engine", "TEXT NOT NULL DEFAULT 'claude-cli'"], // which review engine runs for this user; chosen explicitly by the owner, never inferred
       ["model", "TEXT"], // claude --model alias chosen by the user; NULL = CLI default
