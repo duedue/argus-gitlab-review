@@ -129,6 +129,15 @@ export function getUser(db: Db, username: string): User | undefined {
   return r && toUser(r);
 }
 
+/**
+ * An active (approved and enabled) user by name, matched case-insensitively as GitLab usernames are: `Reviewer1` names
+ * `reviewer1`; an exact-case row wins if two ever differ only in case. Pending sign-ups and disabled users are undefined.
+ */
+export function getActiveUserNoCase(db: Db, username: string): User | undefined {
+  const r = db.prepare(`SELECT * FROM users WHERE username=? COLLATE NOCASE AND enabled=1 AND approved=1 ORDER BY username=? DESC LIMIT 1`).get(username, username) as Record<string, unknown> | undefined;
+  return r && toUser(r);
+}
+
 export const userToken = (key: Buffer, u: User): string => decrypt(key, u.tokenEnc);
 
 // --- personal Claude token (`claude setup-token`). Only written through setClaudeToken / clearClaudeToken / markClaudeTokenRejected. ---

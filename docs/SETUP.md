@@ -127,6 +127,7 @@ docker compose up -d
 | `GITLAB_URL` | Required. Your GitLab URL |
 | `JIRA_URL`, `JIRA_API_TOKEN` | Optional; Jira requirements are read only if both are set, otherwise disabled. Jira Server / Data Center only |
 | `DRY_RUN` | Optional; leave empty. If set, it locks the publish mode (`0` = live, any other value = Dry-run) and the switch buttons on `/admin` are disabled; if unset, `/admin` manages it (default Dry-run). See section 5 |
+| `ARGUS_SKILL_FROM` | Optional, `on` or `off`, default `on`. With `off`, a branch review's `skillFrom` (borrowing another user's review criteria) answers 403 `skill_from_disabled`. Unrecognised values count as `off` and a warning is logged. Put it in `.env`; compose passes it in through `env_file` |
 | `ARGUS_PORT` | Default 3000; the host-side port |
 | `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` | Optional; if set, Argus does not enter `/setup` setup mode |
 | `ARGUS_OWNER` | Optional; a GitLab user ID or username. Takes effect only when there is no owner yet |

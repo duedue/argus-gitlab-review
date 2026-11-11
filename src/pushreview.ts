@@ -28,11 +28,12 @@ export type BranchAdvice = "done" | "running" | "pending_push" | "submit";
  */
 export async function branchStatus(
   db: Db, cfg: Config, u: User, rt: UserRuntime,
-  t: { projectId: number; projectPath: string; defaultBranch?: string; branch: string; base: string; head: string }, now = Date.now(),
+  t: { projectId: number; projectPath: string; defaultBranch?: string; branch: string; base: string; head: string; skillFrom?: string }, now = Date.now(),
 ) {
   const me = u.gitlabUserId;
-  const review = db.prepare(`SELECT * FROM branch_reviews WHERE owner_id=? AND project_id=? AND head_sha=? AND base=? ORDER BY created_at DESC, id DESC LIMIT 1`)
-    .get(me, t.projectId, t.head, t.base) as BranchReviewRow | undefined;
+  // Criteria are part of the key: a review with another user's skill never stands in for one with the owner's own, nor vice versa.
+  const review = db.prepare(`SELECT * FROM branch_reviews WHERE owner_id=? AND project_id=? AND head_sha=? AND base=? AND skill_from IS ? ORDER BY created_at DESC, id DESC LIMIT 1`)
+    .get(me, t.projectId, t.head, t.base, t.skillFrom ?? null) as BranchReviewRow | undefined;
   const optedIn = u.reviewPushedBranches && u.branchDailyCap > 0;
   const row = optedIn ? db.prepare(`SELECT head_sha, pushed_at, handled_sha FROM pushed_branches WHERE owner_id=? AND project_id=? AND branch=?`)
     .get(me, t.projectId, t.branch) as { head_sha: string; pushed_at: number; handled_sha: string | null } | undefined : undefined;
@@ -43,7 +44,8 @@ export async function branchStatus(
   let advice: BranchAdvice = "submit";
   let waiting: string | undefined;
   if (review) advice = review.status === "queued" || review.status === "running" ? "running" : "done";
-  else if (row && dueAt !== null && row.head_sha === t.head && !handled && now < dueAt + 2 * cfg.pollIntervalMs
+  // The push trigger only ever reviews with the owner's own skill: a borrowed-criteria status never waits for it.
+  else if (!t.skillFrom && row && dueAt !== null && row.head_sha === t.head && !handled && now < dueAt + 2 * cfg.pollIntervalMs
     // The poller only reviews: non-default branches, against the default base, in the user's project list, with no open MR.
     && u.skillPath && rt.engine // the poller waits forever on a missing skill/engine (startBranchReview: no_skill_uploaded / no_review_engine)
     && t.defaultBranch !== undefined && t.base === t.defaultBranch && t.branch !== t.defaultBranch
@@ -55,7 +57,7 @@ export async function branchStatus(
   }
   return {
     review: review ? {
-      id: review.id, status: review.status, trigger: review.trigger, verdict: review.verdict, ...storedSummary(review.findings_json),
+      id: review.id, status: review.status, trigger: review.trigger, verdict: review.verdict, skill_from: review.skill_from, ...storedSummary(review.findings_json),
       created_at: review.created_at, finished_at: review.finished_at,
     } : null,
     push: optedIn ? {
@@ -139,8 +141,8 @@ export async function pollPushedBranches(d: Deps, u: User, rt: UserRuntime, now 
     try { project = await rt.gl.getProject(r.project_id); } catch (e) { if (gone(e)) skip(r, "project not visible"); else if (fail(r, e, "project lookup")) return; continue; }
     if (!projectAllowed(project.path_with_namespace.toLowerCase(), u.reviewProjects, u.reviewAllProjects)) { skip(r, "project not in the review list"); continue; }
     if (r.branch === project.default_branch) { skip(r, "default branch"); continue; }
-    // Dedupe on (owner, project, head, base): a manual review against another base does not stand in for the default-base one. Any trigger, any status (failed ones are not auto-retried).
-    if (d.db.prepare(`SELECT 1 FROM branch_reviews WHERE owner_id=? AND project_id=? AND head_sha=? AND base=?`).get(me, r.project_id, r.head_sha, project.default_branch)) { skip(r, "already has a branch review of this head"); continue; }
+    // Dedupe on (owner, project, head, base, own skill): a manual review against another base, or with another user's skill, does not stand in for this one. Any trigger, any status (failed ones are not auto-retried).
+    if (d.db.prepare(`SELECT 1 FROM branch_reviews WHERE owner_id=? AND project_id=? AND head_sha=? AND base=? AND skill_from IS NULL`).get(me, r.project_id, r.head_sha, project.default_branch)) { skip(r, "already has a branch review of this head"); continue; }
     let mrs;
     try { mrs = await rt.gl.listBranchMrs(r.project_id, r.branch); } catch (e) { if (fail(r, e, "MR lookup")) return; continue; }
     if (mrs.length) { skip(r, "branch has an open MR"); continue; } // the normal MR review owns it

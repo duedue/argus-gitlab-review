@@ -264,9 +264,9 @@ test("owner-engine whitelist: startup warning only when non-empty; runs are tagg
 });
 
 test("trigger self: reviews as the caller even when not a reviewer, drafts allowed; default mode still skips the caller", async () => {
-  const t = setup({ mr: mkMr({ reviewers: [{ id: 50, username: "william" }], title: "Draft: wip" }) });
+  const t = setup({ mr: mkMr({ reviewers: [{ id: 50, username: "reviewer1" }], title: "Draft: wip" }) });
   const plain = await (await t.trigger({ mr_url: MR_URL })).json();
-  assert.deepEqual(plain, { queued: [], skipped: [{ username: "william", reason: "not an Argus user" }] });
+  assert.deepEqual(plain, { queued: [], skipped: [{ username: "reviewer1", reason: "not an Argus user" }] });
   const self = await (await t.trigger({ mr_url: MR_URL, self: true })).json();
   assert.deepEqual(self, { queued: ["caller"], skipped: [] });
   await t.queue.idle();

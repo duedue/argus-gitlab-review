@@ -103,6 +103,7 @@ Set in `.env` (compose passes the file to the container). Template: [.env.exampl
 | `JIRA_URL` / `JIRA_API_TOKEN` | empty | optional; both are needed, otherwise Jira context is disabled. Jira Server / Data Center only |
 | `DRY_RUN` | unset | optional. Precedence: env `DRY_RUN` (any non-empty value; only `0` = live) > DB setting `dry_run` (owner toggle on `/admin`, applies without restart) > dry-run ON. When set it locks the toggle |
 | `ARGUS_DEPLOY` | `local` | `compose` (set by `docker-compose.yml`; the UI shows `docker compose ...` commands) or `local`; explicit, never inferred; anything else = `local` + warning |
+| `ARGUS_SKILL_FROM` | `on` | `on` / `off`. `off` makes a branch review's `skillFrom` (borrowing another user's review criteria) answer 403 `skill_from_disabled`; unknown values count as `off` with a warning. In the compose deployment set it in `.env` (passed in through `env_file`) |
 | `ARGUS_PORT` | `3000` | compose only: published host port |
 | `PORT` / `HOST` | `3000` / `127.0.0.1` | web server (`0.0.0.0` in the container) |
 | `DATA_DIR` | `./data` (`/data` in the image) | SQLite db, clone cache, uploaded skills |
@@ -239,7 +240,7 @@ npm run cli -- user set <username> language=en severity_threshold=major confiden
 npm run cli -- user remove <username>
 npm run poll-once                            # one cycle over all enabled users
 npm run cli -- review <project_id> <mr_iid> [--user <username>] [--head <sha>] [--engine claude-cli|codex-cli]   # always dry-run
-npm run cli -- review-branch <project> <branch> [--base <branch>] [--user <u>] [--engine ...] [--json]   # pre-MR review, prints only; host/dev aid (runs outside the queue: not beside a busy server), users should use POST /api/review-branch
+npm run cli -- review-branch <project> <branch> [--base <branch>] [--user <u>] [--engine ...] [--skill-from <u>] [--json]   # pre-MR review, prints only; host/dev aid (runs outside the queue: not beside a busy server), users should use POST /api/review-branch
 ```
 
 `user add` checks the PAT via `GET /user` and `/personal_access_tokens/self` (needs `api` scope, not expired) and stores it AES-256-GCM encrypted. Master key: Keychain item `argus`/`master-key`, fallback env `ARGUS_MASTER_KEY`; no key = refuse to run.

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import type { Config } from "./config.ts";
 import { laneFor, reviewTimeoutMs } from "./engine.ts";
 import { activeBranchReview, finishBranchReview, getBranchReview, insertBranchReview, setBranchReviewRunning, type BranchReviewRow, type BranchReviewTrigger, type Db } from "./db.ts";
@@ -8,7 +9,7 @@ import { readProjectContext } from "./context.ts";
 import { prepareDiff } from "./repo.ts";
 import { queueKey, type ReviewQueue } from "./queue.ts";
 import type { UserRuntime } from "./review.ts";
-import { engineFields, type User } from "./users.ts";
+import { engineFields, getActiveUserNoCase, type User } from "./users.ts";
 
 /**
  * Pre-MR review of a branch against its base. Same engine/prompt/skill/limits as an MR review, but the diff comes
@@ -19,6 +20,7 @@ export interface BranchTarget {
   project: string; // numeric id or full path
   branch: string;
   base?: string; // default: the project's default branch
+  skillFrom?: string; // username whose skill + thresholds to review with (see criteriaFor); unset = the caller's own
 }
 
 export interface BranchResult {
@@ -33,10 +35,11 @@ export interface BranchResult {
   belowThreshold: Finding[]; // the rest (an MR review lists these in its summary only)
   model?: string;
   skipped?: string; // set when no engine ran: "no reviewable changes" | "diff too large (N > M lines)"
+  skillFrom?: string; // borrowed criteria (branch_reviews.skill_from); unset = the owner's own skill
 }
 
 export class BranchError extends Error {
-  constructor(public status: 400 | 401 | 404 | 429 | 502, public code: string, public extra?: { active_id: string }) {
+  constructor(public status: 400 | 401 | 403 | 404 | 429 | 502, public code: string, public extra?: { active_id: string }) {
     super(code);
   }
 }
@@ -47,6 +50,30 @@ export function validBranchName(s: unknown): s is string {
   return typeof s === "string" && /^[\w.+\/-]{1,255}$/.test(s) && !/^[-\/.]|\.\.|\/\/|\/$|\.lock$|\/\./.test(s);
 }
 export const validProjectRef = (s: unknown): s is string => typeof s === "string" && s.length <= 255 && PROJECT_RE.test(s);
+
+/**
+ * Who the engine reviews as. Without `skillFrom`: the caller. With it: still the caller (same id, engine, model, Claude/GitLab
+ * credentials, language, diff limit, queue lane, DB ownership) with ONLY the named user's skill file and severity/confidence
+ * thresholds swapped in, so `findings` match what that user's MR review would treat as blocking. The named user's runtime,
+ * engine and tokens are never touched: the runtime is built from the returned user, whose gitlabUserId is the caller's.
+ * The name matches case-insensitively (GitLab usernames do). Only active users can be named (getActiveUserNoCase): a pending
+ * sign-up or a disabled user is reported as unknown_user, so their skill is never borrowed and their existence is not revealed.
+ * Naming yourself is the same as naming nobody. Throws BranchError (403 skill_from_disabled / 400 invalid_skill_from /
+ * 404 unknown_user / 400 no_skill).
+ */
+export function criteriaFor(cfg: Pick<Config, "skillFrom">, db: Db, caller: User, skillFrom: string | undefined): { user: User; skillFrom?: string } {
+  if (skillFrom === undefined) return { user: caller };
+  if (!cfg.skillFrom) throw new BranchError(403, "skill_from_disabled");
+  if (!/^[\w.-]{1,255}$/.test(skillFrom)) throw new BranchError(400, "invalid_skill_from");
+  const from = getActiveUserNoCase(db, skillFrom);
+  if (!from) throw new BranchError(404, "unknown_user");
+  if (from.gitlabUserId === caller.gitlabUserId) return { user: caller };
+  if (!from.skillPath || !existsSync(from.skillPath)) throw new BranchError(400, "no_skill");
+  return {
+    user: { ...caller, skillPath: from.skillPath, severityThreshold: from.severityThreshold, confidenceThreshold: from.confidenceThreshold },
+    skillFrom: from.username,
+  };
+}
 
 interface Resolved { projectId: number; projectPath: string; repoUrl: string; head: string; base: string; mergeBase: string }
 
@@ -115,8 +142,8 @@ export async function runBranchReview(cfg: Config, user: User, rt: UserRuntime, 
 
 /** The wire shape shared by the API and `--json`: snake_case keys. */
 export function branchResultJson(r: BranchResult) {
-  const { mergeBase, belowThreshold, ...rest } = r;
-  return { ...rest, merge_base: mergeBase, below_threshold: belowThreshold };
+  const { mergeBase, belowThreshold, skillFrom, ...rest } = r;
+  return { ...rest, merge_base: mergeBase, below_threshold: belowThreshold, skill_from: skillFrom ?? null };
 }
 
 // --- async API jobs (rows of branch_reviews; survive restarts; never touch the MR `reviews` table) ---
@@ -132,20 +159,21 @@ export interface BranchJob {
   head: string;
   mergeBase: string;
   createdAt: number;
+  skillFrom?: string;
   result?: BranchResult;
   error?: string;
 }
 
 /** Persists a finished run (shared by the API job and the CLI). */
 export function saveBranchResult(db: Db, id: string, r: BranchResult): void {
-  const { verdict, summary, head: _h, base: _b, mergeBase: _m, ...rest } = r;
+  const { verdict, summary, head: _h, base: _b, mergeBase: _m, skillFrom: _s, ...rest } = r; // skill_from has its own column
   finishBranchReview(db, id, { verdict, summary, findingsJson: JSON.stringify(rest) });
 }
 
 /** Records a run that is executing right now outside the queue (CLI). Returns the row id. */
-export function startBranchRun(db: Db, ownerId: number, r: Resolved, t: BranchTarget, trigger: BranchReviewTrigger): string {
+export function startBranchRun(db: Db, ownerId: number, r: Resolved, t: BranchTarget, trigger: BranchReviewTrigger, skillFrom?: string): string {
   const id = randomUUID();
-  insertBranchReview(db, { id, owner_id: ownerId, project_id: r.projectId, project_path: r.projectPath, branch: t.branch, base: r.base, merge_base: r.mergeBase, head_sha: r.head, trigger, status: "running" });
+  insertBranchReview(db, { id, owner_id: ownerId, project_id: r.projectId, project_path: r.projectPath, branch: t.branch, base: r.base, merge_base: r.mergeBase, head_sha: r.head, trigger, status: "running", skill_from: skillFrom });
   return id;
 }
 
@@ -153,13 +181,14 @@ function jobFromRow(r: BranchReviewRow): BranchJob {
   const stored = r.findings_json ? (JSON.parse(r.findings_json) as Omit<BranchResult, "head" | "base" | "mergeBase" | "verdict" | "summary">) : undefined;
   return {
     id: r.id, userId: r.owner_id, status: r.status, finishedAt: r.finished_at ?? undefined, project: String(r.project_id), branch: r.branch, base: r.base,
-    head: r.head_sha, mergeBase: r.merge_base, createdAt: r.created_at, error: r.error ?? undefined,
-    result: stored && { ...stored, head: r.head_sha, base: r.base, mergeBase: r.merge_base, verdict: (r.verdict as Verdict | null) ?? undefined, summary: r.summary ?? undefined },
+    head: r.head_sha, mergeBase: r.merge_base, createdAt: r.created_at, error: r.error ?? undefined, skillFrom: r.skill_from ?? undefined,
+    result: stored && { ...stored, head: r.head_sha, base: r.base, mergeBase: r.merge_base, verdict: (r.verdict as Verdict | null) ?? undefined, summary: r.summary ?? undefined, skillFrom: r.skill_from ?? undefined },
   };
 }
 
-/** Queue dedupe key of one (user, project, head, merge-base) review. */
-export const branchQueueKey = (userId: number, projectId: number, head: string, mergeBase: string): string => `branch:${queueKey(userId, projectId, head)}:${mergeBase}`;
+/** Queue dedupe key of one (user, project, head, merge-base, borrowed criteria) review. */
+export const branchQueueKey = (userId: number, projectId: number, head: string, mergeBase: string, skillFrom?: string): string =>
+  `branch:${queueKey(userId, projectId, head)}:${mergeBase}${skillFrom ? `:skill-from:${skillFrom}` : ""}`;
 
 export function getBranchJob(db: Db, id: string, userId: number): BranchJob | undefined {
   const r = getBranchReview(db, userId, id); // another user's id looks like a missing one
@@ -175,10 +204,11 @@ export interface BranchDeps {
 
 /** Validates against GitLab synchronously (fast), then queues the slow review in the caller's lane. */
 export async function startBranchReview(d: BranchDeps, caller: User, t: BranchTarget, charge: () => boolean = () => true, trigger: BranchReviewTrigger = "api"): Promise<BranchJob> {
-  if (!caller.skillPath) throw new BranchError(400, "no_skill_uploaded");
+  const { user: runUser, skillFrom } = criteriaFor(d.cfg, d.db, caller, t.skillFrom);
+  if (!runUser.skillPath) throw new BranchError(400, "no_skill_uploaded");
   let rt: UserRuntime;
   try {
-    rt = await d.runtimeFor(caller);
+    rt = await d.runtimeFor(runUser); // the caller's runtime (credentials keyed on the caller's id), see criteriaFor
   } catch {
     throw new BranchError(401, "caller_token_invalid");
   }
@@ -188,24 +218,24 @@ export async function startBranchReview(d: BranchDeps, caller: User, t: BranchTa
   // The same commit pair already in flight is handed back instead of rejected.
   const act = activeBranchReview(d.db, caller.gitlabUserId);
   if (act) {
-    if (act.project_id === r.projectId && act.head_sha === r.head && act.merge_base === r.mergeBase) return jobFromRow(act);
+    if (act.project_id === r.projectId && act.head_sha === r.head && act.merge_base === r.mergeBase && act.skill_from === (skillFrom ?? null)) return jobFromRow(act);
     throw new BranchError(429, "too_many_active", { active_id: act.id });
   }
   // An identical run still winding down in the queue would never start this job: reject before charging.
-  const qkey = branchQueueKey(caller.gitlabUserId, r.projectId, r.head, r.mergeBase);
+  const qkey = branchQueueKey(caller.gitlabUserId, r.projectId, r.head, r.mergeBase, skillFrom);
   if (d.queue.has(qkey)) throw new BranchError(429, "too_many_active");
   if (!charge()) throw new BranchError(429, "rate_limited"); // charged only when a job is really created
   const id = randomUUID();
-  insertBranchReview(d.db, { id, owner_id: caller.gitlabUserId, project_id: r.projectId, project_path: r.projectPath, branch: t.branch, base: r.base, merge_base: r.mergeBase, head_sha: r.head, trigger });
+  insertBranchReview(d.db, { id, owner_id: caller.gitlabUserId, project_id: r.projectId, project_path: r.projectPath, branch: t.branch, base: r.base, merge_base: r.mergeBase, head_sha: r.head, trigger, skill_from: skillFrom });
   d.queue.enqueue(laneFor(engineFields(caller), d.cfg.ownerEngineTestUsers), qkey, async () => {
     setBranchReviewRunning(d.db, id);
     try {
-      saveBranchResult(d.db, id, await runBranchReview(d.cfg, caller, rt, t, r));
+      saveBranchResult(d.db, id, await runBranchReview(d.cfg, runUser, rt, t, r));
     } catch (e) {
       console.error(`[branch-review] ${caller.username} ${t.project}@${t.branch} FAILED: ${(e as Error).message}`);
       finishBranchReview(d.db, id, { error: "review_failed" }); // detail (may hold server paths) stays in the log
     }
   });
-  console.log(`[branch-review] ${caller.username} ${t.project}@${t.branch} queued (${id})`);
+  console.log(`[branch-review] ${caller.username} ${t.project}@${t.branch} queued (${id})${skillFrom ? ` with ${skillFrom}'s criteria` : ""}`);
   return jobFromRow(getBranchReview(d.db, caller.gitlabUserId, id)!);
 }

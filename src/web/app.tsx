@@ -23,7 +23,7 @@ import { chooseEngine, laneFor } from "../engine.ts";
 import type { Finding } from "../findings.ts";
 import { attachedMrs, getBranchReviewById, listBranchReviews, type BranchReviewRow } from "../db.ts";
 import { branchStatus } from "../pushreview.ts";
-import { BranchError, branchResultJson, getBranchJob, resolveHead, startBranchReview, storedSummary, validBranchName, validProjectRef } from "../branchreview.ts";
+import { BranchError, branchResultJson, criteriaFor, getBranchJob, resolveHead, startBranchReview, storedSummary, validBranchName, validProjectRef } from "../branchreview.ts";
 import { makeRateLimiter, parseMrUrl, TRIGGER_LIMIT_PER_HOUR, triggerReviews, TriggerError } from "../trigger.ts";
 import { DOCS, loadDocs, type DocKey } from "./docs.ts";
 import {
@@ -431,13 +431,14 @@ export function createApp({
       c.header("Retry-After", "3600");
       return c.json({ error: "rate_limited" }, 429);
     }
-    const body = (await c.req.json().catch(() => undefined)) as { project?: unknown; branch?: unknown; base?: unknown } | undefined;
+    const body = (await c.req.json().catch(() => undefined)) as { project?: unknown; branch?: unknown; base?: unknown; skillFrom?: unknown } | undefined;
     if (!validProjectRef(body?.project)) return c.json({ error: "invalid_project" }, 400);
     if (!validBranchName(body?.branch)) return c.json({ error: "invalid_branch" }, 400);
     if (body?.base !== undefined && !validBranchName(body.base)) return c.json({ error: "invalid_base" }, 400);
+    if (body?.skillFrom !== undefined && typeof body.skillFrom !== "string") return c.json({ error: "invalid_skill_from" }, 400);
     try {
-      const j = await startBranchReview({ cfg, db, queue, runtimeFor }, auth.caller, { project: body!.project as string, branch: body!.branch as string, base: body?.base as string | undefined }, () => triggerAllowed(String(auth.caller.gitlabUserId)));
-      return c.json({ id: j.id, status: j.status, head: j.head, base: j.base, merge_base: j.mergeBase }, 202);
+      const j = await startBranchReview({ cfg, db, queue, runtimeFor }, auth.caller, { project: body!.project as string, branch: body!.branch as string, base: body?.base as string | undefined, skillFrom: body?.skillFrom as string | undefined }, () => triggerAllowed(String(auth.caller.gitlabUserId)));
+      return c.json({ id: j.id, status: j.status, head: j.head, base: j.base, merge_base: j.mergeBase, skill_from: j.skillFrom ?? null }, 202);
     } catch (e) {
       if (e instanceof BranchError) {
         if (e.code === "rate_limited") c.header("Retry-After", "3600");
@@ -452,7 +453,7 @@ export function createApp({
     if ("res" in auth) return auth.res;
     const j = getBranchJob(db, c.req.param("id"), auth.caller.gitlabUserId);
     if (!j) return c.json({ error: "not_found" }, 404);
-    return c.json({ id: j.id, status: j.status, project: j.project, branch: j.branch, base: j.base, head: j.head, error: j.error, ...(j.result ? branchResultJson(j.result) : { merge_base: j.mergeBase }) });
+    return c.json({ id: j.id, status: j.status, project: j.project, branch: j.branch, base: j.base, head: j.head, error: j.error, ...(j.result ? branchResultJson(j.result) : { merge_base: j.mergeBase, skill_from: j.skillFrom ?? null }) });
   });
 
   // Read-only: does this branch head already have (or is about to get) a branch review? Own limiter (600/h/user), not the POST ones.
@@ -463,15 +464,16 @@ export function createApp({
       c.header("Retry-After", "3600"); // upper bound: the limiter is a rolling window
       return c.json({ error: "rate_limited" }, 429);
     }
-    const project = c.req.query("project"), branch = c.req.query("branch"), base = c.req.query("base");
+    const project = c.req.query("project"), branch = c.req.query("branch"), base = c.req.query("base"), skillFromQ = c.req.query("skill_from");
     if (!validProjectRef(project)) return c.json({ error: "invalid_project" }, 400);
     if (!validBranchName(branch)) return c.json({ error: "invalid_branch" }, 400);
     if (base !== undefined && !validBranchName(base)) return c.json({ error: "invalid_base" }, 400);
     try {
+      const { skillFrom } = criteriaFor(cfg, db, auth.caller, skillFromQ); // same checks and normalization as the POST
       const rt = await runtimeFor(auth.caller).catch(() => { throw new BranchError(401, "caller_token_invalid"); });
       const r = await resolveHead(rt, { project, branch, base }, true);
-      const s = await branchStatus(db, cfg, auth.caller, rt, { projectId: r.project.id, projectPath: r.project.path_with_namespace, defaultBranch: r.project.default_branch, branch, base: r.base, head: r.head });
-      return c.json({ project_id: r.project.id, project_path: r.project.path_with_namespace, branch, base: r.base, head: r.head, ...s });
+      const s = await branchStatus(db, cfg, auth.caller, rt, { projectId: r.project.id, projectPath: r.project.path_with_namespace, defaultBranch: r.project.default_branch, branch, base: r.base, head: r.head, skillFrom });
+      return c.json({ project_id: r.project.id, project_path: r.project.path_with_namespace, branch, base: r.base, head: r.head, skill_from: skillFrom ?? null, ...s });
     } catch (e) {
       if (e instanceof BranchError) return c.json({ error: e.code }, e.status);
       throw e;
@@ -494,7 +496,7 @@ export function createApp({
         const sum = storedSummary(r.findings_json);
         return {
           id: r.id, status: r.status, trigger: r.trigger, project_id: r.project_id, project_path: r.project_path, branch: r.branch, base: r.base, head: r.head_sha,
-          merge_base: r.merge_base, verdict: r.verdict, findings_count: sum.findings_count, below_threshold_count: sum.below_threshold_count,
+          merge_base: r.merge_base, skill_from: r.skill_from, verdict: r.verdict, findings_count: sum.findings_count, below_threshold_count: sum.below_threshold_count,
           skipped: sum.skipped, error: r.error, created_at: r.created_at, finished_at: r.finished_at,
         };
       }),

@@ -6,7 +6,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApiKey } from "../src/apikeys.ts";
-import { branchQueueKey, getBranchJob, resolveBranch, runBranchReview, validBranchName, validProjectRef } from "../src/branchreview.ts";
+import { branchQueueKey, criteriaFor, getBranchJob, resolveBranch, runBranchReview, validBranchName, validProjectRef } from "../src/branchreview.ts";
 import { loadConfig } from "../src/config.ts";
 import { activeBranchReview, claimReview, failStaleCliBranchReviews, findDoneBranchReview, finishBranchReview, insertBranchReview, listBranchReviews, openDb, releaseStaleRunning, type BranchReviewRow } from "../src/db.ts";
 import type { ReviewEngine, ReviewInput } from "../src/engine.ts";
@@ -505,4 +505,150 @@ test("storedSummary tolerates a corrupt findings_json (status and list do not 50
   const s = (await t.json()) as unknown as { advice: string; review: { findings_count: number | null } };
   assert.deepEqual([s.advice, s.review.findings_count], ["done", null]);
   assert.equal((await t.app.request("/api/branch-reviews", { headers: { authorization: `Bearer ${t.key}` } })).status, 200);
+});
+
+// --- skillFrom: another user's skill + thresholds, the caller's engine/credentials ---
+const rvwSkillDir = mkdtempSync(join(tmpdir(), "skill-reviewer-"));
+writeFileSync(join(rvwSkillDir, "SKILL.md"), "REVIEWER-CRITERIA");
+const rvwSkill = join(rvwSkillDir, "SKILL.md");
+/** Adds reviewer1 (id 294, own engine settings and thresholds that differ from the caller's) and nobody (no usable skill). */
+function addReviewer(db: ReturnType<typeof openDb>) {
+  addUser(db, key, { gitlabUserId: 294, username: "reviewer1", token: "reviewer-pat", tokenExpiresAt: null, skillPath: rvwSkill, isOwner: false });
+  setUser(db, "reviewer1", ["severity_threshold=nit", "confidence_threshold=0.5", "engine=codex-cli", "language=en"]);
+  addUser(db, key, { gitlabUserId: 3, username: "noskill", token: "p", tokenExpiresAt: null, skillPath, isOwner: false });
+  db.prepare(`UPDATE users SET skill_path='' WHERE username='noskill'`).run();
+}
+
+test("ARGUS_SKILL_FROM: default on, off/OFF off, unknown fails closed", () => {
+  const c = (v?: string) => loadConfig({ DATA_DIR: "x", ...(v === undefined ? {} : { ARGUS_SKILL_FROM: v }) }).skillFrom;
+  const warn = console.warn; console.warn = () => {};
+  try {
+    assert.deepEqual([c(), c(""), c("on"), c("ON"), c("off"), c(" Off "), c("bogus")], [true, true, true, true, false, false, false]);
+  } finally { console.warn = warn; }
+});
+
+test("criteriaFor: swaps only the skill and thresholds; errors for unknown user, no skill, disabled, bad name; self = own", () => {
+  const { cfg, db, user } = setup();
+  addReviewer(db);
+  setUser(db, "caller", ["language=ja", "max_diff_lines=500"]);
+  const caller = getUser(db, "caller")!;
+  assert.deepEqual(criteriaFor(cfg, db, caller, undefined), { user: caller });
+  const { user: u, skillFrom } = criteriaFor(cfg, db, caller, "reviewer1");
+  assert.equal(skillFrom, "reviewer1");
+  assert.deepEqual([u.skillPath, u.severityThreshold, u.confidenceThreshold], [rvwSkill, "nit", 0.5], "the reviewer's criteria");
+  assert.deepEqual({ ...u, skillPath: caller.skillPath, severityThreshold: caller.severityThreshold, confidenceThreshold: caller.confidenceThreshold }, caller, "everything else is the caller's (id, tokens, engine, model, language, limits)");
+  assert.deepEqual(criteriaFor(cfg, db, caller, "caller"), { user: caller }, "naming yourself = your own skill");
+  assert.throws(() => criteriaFor(cfg, db, caller, "ghost"), { status: 404, code: "unknown_user" });
+  assert.equal(criteriaFor(cfg, db, caller, "Reviewer1").skillFrom, "reviewer1", "GitLab usernames are case-insensitive");
+  db.prepare(`UPDATE users SET enabled=0 WHERE username='reviewer1'`).run();
+  assert.throws(() => criteriaFor(cfg, db, caller, "reviewer1"), { status: 404, code: "unknown_user" }, "disabled user: never borrowed");
+  db.prepare(`UPDATE users SET enabled=1, approved=0 WHERE username='reviewer1'`).run();
+  assert.throws(() => criteriaFor(cfg, db, caller, "reviewer1"), { status: 404, code: "unknown_user" }, "pending sign-up: never borrowed");
+  db.prepare(`UPDATE users SET approved=1 WHERE username='reviewer1'`).run();
+  assert.throws(() => criteriaFor(cfg, db, caller, "noskill"), { status: 400, code: "no_skill" });
+  assert.throws(() => criteriaFor(cfg, db, caller, "a b"), { status: 400, code: "invalid_skill_from" });
+  assert.throws(() => criteriaFor({ ...cfg, skillFrom: false }, db, caller, "reviewer1"), { status: 403, code: "skill_from_disabled" });
+  void user;
+});
+
+/** App whose runtimeFor records who it is built for (the engine echoes the skill file it would load). */
+function skillFromApi(env: Record<string, string> = {}) {
+  const r = repo();
+  const cfg = loadConfig({ DATA_DIR: mkdtempSync(join(tmpdir(), "t-")), GITLAB_URL: GL, ...env });
+  const db = openDb(":memory:");
+  addUser(db, key, { gitlabUserId: 1, username: "caller", token: "pat", tokenExpiresAt: null, skillPath, isOwner: false });
+  addReviewer(db);
+  const built: User[] = [];
+  const skills: string[] = [];
+  const runtimeFor = async (u: User): Promise<UserRuntime> => {
+    built.push(u);
+    const rt = mkRt(r, []);
+    return { ...rt, engine: { review: async (i) => (skills.push(readFileSync(u.skillPath, "utf8")), rt.engine!.review(i)) } as ReviewEngine };
+  };
+  const queue = new ReviewQueue();
+  const app = createApp({ cfg, db, key, oauth: { gitlabUrl: GL, redirectUri: "x", clientId: "c", clientSecret: "s" }, runtimeFor, queue });
+  const h = { authorization: `Bearer ${createApiKey(db, 1)}`, "content-type": "application/json" };
+  const post = (body: unknown) => app.request("/api/review-branch", { method: "POST", headers: h, body: JSON.stringify(body) });
+  const get = (path: string) => app.request(path, { headers: h });
+  return { r, cfg, db, app, queue, built, skills, post, get };
+}
+
+test("api skillFrom: caller's runtime with the reviewer's skill + thresholds; recorded on the row and shown in the result", async () => {
+  const t = skillFromApi();
+  const res = await t.post({ project: "g/p", branch: "feat", skillFrom: "reviewer1" });
+  assert.equal(res.status, 202);
+  const { id, skill_from } = (await res.json()) as { id: string; skill_from: string };
+  assert.equal(skill_from, "reviewer1");
+  await t.queue.idle();
+  assert.ok(t.built.length > 0);
+  for (const u of t.built) {
+    assert.equal(u.gitlabUserId, 1, "runtime (GitLab token, Claude token, engine) is only ever built for the caller");
+    assert.equal(u.engine, "claude-cli", "caller's engine, not the reviewer's codex-cli");
+    assert.equal(u.language, "zh-TW", "caller's language");
+  }
+  assert.deepEqual(t.skills, ["REVIEWER-CRITERIA"], "the engine loads the reviewer's skill");
+  const done = (await (await t.get(`/api/review-branch/${id}`)).json()) as { status: string; skill_from: string; findings: { severity: string }[]; below_threshold: unknown[] };
+  assert.equal(done.status, "done");
+  assert.equal(done.skill_from, "reviewer1");
+  assert.deepEqual(done.findings.map((f) => f.severity), ["major", "nit"], "the reviewer's nit threshold: the nit is blocking too");
+  assert.equal(done.below_threshold.length, 0);
+  const row = t.db.prepare(`SELECT skill_from, owner_id FROM branch_reviews WHERE id=?`).get(id) as { skill_from: string; owner_id: number };
+  assert.deepEqual(row, { skill_from: "reviewer1", owner_id: 1 }, "owned by the caller");
+  const list = (await (await t.get("/api/branch-reviews")).json()) as { items: { skill_from: string | null }[] };
+  assert.equal(list.items[0]!.skill_from, "reviewer1");
+  // without skillFrom: own skill, own thresholds, skill_from null
+  const own = (await (await t.post({ project: "g/p", branch: "feat" })).json()) as { id: string; skill_from: string | null };
+  assert.notEqual(own.id, id, "a review with own criteria is a new job, not the borrowed one");
+  assert.equal(own.skill_from, null);
+  await t.queue.idle();
+  const ownDone = (await (await t.get(`/api/review-branch/${own.id}`)).json()) as { findings: unknown[]; skill_from: string | null };
+  assert.deepEqual([ownDone.findings.length, ownDone.skill_from], [1, null]);
+});
+
+test("api skillFrom: unknown_user 404, no_skill 400, non-string 400, disabled 403; nothing queued or charged", async () => {
+  const t = skillFromApi();
+  for (const [skillFrom, status, error] of [["ghost", 404, "unknown_user"], ["noskill", 400, "no_skill"], [5, 400, "invalid_skill_from"], ["a;b", 400, "invalid_skill_from"]] as const) {
+    const res = await t.post({ project: "g/p", branch: "feat", skillFrom });
+    assert.equal(res.status, status, String(skillFrom));
+    assert.equal(((await res.json()) as { error: string }).error, error);
+  }
+  const off = skillFromApi({ ARGUS_SKILL_FROM: "off" });
+  const res = await off.post({ project: "g/p", branch: "feat", skillFrom: "reviewer1" });
+  assert.equal(res.status, 403);
+  assert.equal(((await res.json()) as { error: string }).error, "skill_from_disabled");
+  assert.equal((await off.get("/api/branch-status?project=g/p&branch=feat&skill_from=reviewer1")).status, 403);
+  assert.equal((await off.post({ project: "g/p", branch: "feat" })).status, 202, "own-skill reviews are unaffected");
+  await off.queue.idle();
+  for (const x of [t, off]) assert.equal((x.db.prepare(`SELECT COUNT(*) n FROM branch_reviews WHERE skill_from IS NOT NULL`).get() as { n: number }).n, 0);
+});
+
+test("dedupe: borrowed and own reviews of the same head never stand in for each other (active job, queue key, branch-status)", async () => {
+  const t = skillFromApi();
+  const own = (await (await t.post({ project: "g/p", branch: "feat" })).json()) as { id: string };
+  const borrowed = await t.post({ project: "g/p", branch: "feat", skillFrom: "reviewer1" });
+  assert.equal(borrowed.status, 429, "the active own-skill job is not handed back for a borrowed request (one active job per user still applies)");
+  assert.deepEqual(await borrowed.json(), { error: "too_many_active", active_id: own.id });
+  assert.equal(((await (await t.post({ project: "g/p", branch: "feat" })).json()) as { id: string }).id, own.id, "same criteria: handed back");
+  await t.queue.idle();
+  assert.notEqual(branchQueueKey(1, 9, "h", "m"), branchQueueKey(1, 9, "h", "m", "reviewer1"));
+  const status = async (q: string) => (await (await t.get(`/api/branch-status?project=g/p&branch=feat${q}`)).json()) as { advice: string; skill_from: string | null; review: { id: string; skill_from: string | null } | null };
+  assert.deepEqual([(await status("")).advice, (await status("")).review?.id], ["done", own.id]);
+  const b = await status("&skill_from=reviewer1");
+  assert.deepEqual([b.advice, b.review, b.skill_from], ["submit", null, "reviewer1"], "own review does not count for the reviewer's criteria");
+  const bj = (await (await t.post({ project: "g/p", branch: "feat", skillFrom: "reviewer1" })).json()) as { id: string };
+  await t.queue.idle();
+  const b2 = await status("&skill_from=reviewer1");
+  assert.deepEqual([b2.advice, b2.review?.id, b2.review?.skill_from], ["done", bj.id, "reviewer1"]);
+  t.db.prepare(`DELETE FROM branch_reviews WHERE id=?`).run(own.id);
+  assert.equal((await status("")).advice, "submit", "and the borrowed one does not count for own criteria");
+  assert.equal((await status("&skill_from=caller")).review, null, "naming yourself = own criteria");
+  assert.equal((await t.get("/api/branch-status?project=g/p&branch=feat&skill_from=ghost")).status, 404);
+});
+
+test("status: skill_from never reports pending_push (the push trigger only reviews with the owner's own skill)", async () => {
+  const t = statusApi({ settings: OPT });
+  addReviewer(t.db);
+  t.push(t.r.head, Date.now() - 60_000);
+  assert.equal((await t.json()).advice, "pending_push");
+  assert.equal((await t.json(`${t.q}&skill_from=reviewer1`)).advice, "submit");
 });

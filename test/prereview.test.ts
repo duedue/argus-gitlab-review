@@ -46,9 +46,9 @@ function setup(o: { authorId?: number; target?: string; dryRun?: boolean } = {})
     prepare: async (opts) => (preps.push(opts), { dir: "/nonexistent", diff: "+x\n", lines: 1, files: ["a.ts"], incremental: false }),
   };
   const cfg = { ...loadConfig({}), dryRun: o.dryRun === true };
-  const stored = (over: { base?: string; head?: string; owner?: number; skipped?: string; status?: "done" | "failed" } = {}) => {
+  const stored = (over: { base?: string; head?: string; owner?: number; skipped?: string; status?: "done" | "failed"; skillFrom?: string } = {}) => {
     const id = `br-${Math.random()}`;
-    insertBranchReview(db, { id, owner_id: over.owner ?? 1, project_id: 9, project_path: "g/p", branch: "feat", base: over.base ?? "main", merge_base: "m".repeat(40), head_sha: over.head ?? HEAD, trigger: "api" });
+    insertBranchReview(db, { id, owner_id: over.owner ?? 1, project_id: 9, project_path: "g/p", branch: "feat", base: over.base ?? "main", merge_base: "m".repeat(40), head_sha: over.head ?? HEAD, trigger: "api", skill_from: over.skillFrom });
     if (over.status === "failed") finishBranchReview(db, id, { error: "review_failed" });
     else finishBranchReview(db, id, { verdict: "approve", summary: "SUMMARY-TEXT", findingsJson: JSON.stringify({ findings: [f()], belowThreshold: [f({ severity: "nit", title: "n", line: undefined })], lines: 1, files: ["a.ts"], skipped: over.skipped }) });
     return id;
@@ -97,6 +97,7 @@ test("attach: no match -> normal review (target != base, other head, other owner
     ["failed review", {}, { status: "failed" as const }],
     ["skipped review", {}, { skipped: "diff too large" }],
     ["author is not the user", { authorId: 5 }, {}],
+    ["reviewed with another user's skill", {}, { skillFrom: "reviewer1" }],
   ] as const) {
     const t = setup(setupOpt);
     t.stored(stored);
@@ -190,8 +191,8 @@ function pollSetup(o: { noteFails?: boolean; mrUpdatedAt?: string; getMrSha?: st
   } as unknown as GitLab;
   const rt: UserRuntime = { token: async () => "t", gl, engine: { review: async () => (engineRuns++, { findings: [], resolved: [] }) }, prepare: async () => ({ dir: "/x", diff: "+x\n", lines: 1, files: ["a"], incremental: false }) };
   const cfg = { ...loadConfig({ GITLAB_URL: "https://gl.test", DATA_DIR: mkdtempSync(join(tmpdir(), "t-")) }), dryRun: false };
-  const stored = (base = "main") => {
-    insertBranchReview(db, { id: `b-${Math.random()}`, owner_id: 1, project_id: 9, project_path: "g/p", branch: "feat", base, merge_base: "m".repeat(40), head_sha: HEAD, trigger: "api" });
+  const stored = (base = "main", skillFrom?: string) => {
+    insertBranchReview(db, { id: `b-${Math.random()}`, owner_id: 1, project_id: 9, project_path: "g/p", branch: "feat", base, merge_base: "m".repeat(40), head_sha: HEAD, trigger: "api", skill_from: skillFrom });
     db.prepare(`UPDATE branch_reviews SET status='done', verdict='approve', findings_json=?`).run(JSON.stringify({ findings: [f()], belowThreshold: [] }));
   };
   const poll = async () => { const l = console.log, e = console.error; console.log = console.error = () => {}; try { await pollOnce(cfg, db, [getUser(db, "alice")!], () => rt, new ReviewQueue()); } finally { Object.assign(console, { log: l, error: e }); } };
@@ -211,6 +212,18 @@ test("poller: the author's own open MR gets the stored branch review attached (a
   await t.poll();
   assert.equal(t.notes.length, 1, "same head is not posted again");
   assert.equal(t.authoredCalls(), 1, "everything attached: the authored list is no longer fetched");
+});
+
+test("poller: a review done with another user's skill never opens the attach gate nor gets attached; the author's own one still does", async () => {
+  const t = pollSetup();
+  t.stored("main", "reviewer1");
+  await t.poll();
+  assert.deepEqual([t.authoredCalls(), t.notes.length], [0, 0], "borrowed criteria are not the author's review");
+  assert.equal(oldestUnattachedBranchReviewAt(t.db, 1), undefined);
+  assert.equal(findDoneBranchReview(t.db, 1, 9, HEAD, "main"), undefined);
+  t.stored("main");
+  await t.poll();
+  assert.equal(t.notes.length, 1, "own-skill review of the same head attaches as before");
 });
 
 test("poller: the authored list is narrowed with updated_after = the oldest unattached review, and a skipped/failed review does not open the gate", async () => {

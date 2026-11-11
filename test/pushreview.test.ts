@@ -244,6 +244,15 @@ test("push: dedupe includes the base: a manual review of this head against anoth
   assert.equal(same.rows().filter((r) => r.trigger === "push").length, 0, "same base still dedupes");
 });
 
+test("push: dedupe ignores a review with another user's skill (borrowed criteria never stand in for the owner's own)", async () => {
+  const t = setup({ events: [ev("feat", S, 10)], tips: { feat: S } });
+  insertBranchReview(t.db, { id: "borrowed", owner_id: 1, project_id: 9, project_path: "g/p", branch: "feat", base: "main", merge_base: "m", head_sha: S, trigger: "api", skill_from: "reviewer1" });
+  t.db.prepare(`UPDATE branch_reviews SET status='done'`).run();
+  await t.poll();
+  assert.equal(t.rows().filter((r) => r.trigger === "push").length, 1);
+  assert.equal((t.db.prepare(`SELECT skill_from s FROM branch_reviews WHERE trigger='push'`).get() as { s: string | null }).s, null, "the push trigger uses the owner's own skill");
+});
+
 test("pollOnce wires the push trigger: opted-in user gets a trigger='push' branch review after the debounce; opted-out gets none", async () => {
   for (const [optIn, want] of [[true, 1], [false, 0]] as const) {
     const t = setup({ settings: [`review_pushed_branches=${optIn ? 1 : 0}`, "review_all_projects=1"], events: [{ ...ev("feat", S, 0), created_at: new Date(Date.now() - 10 * 60_000).toISOString() }], tips: { feat: S } });
@@ -273,5 +282,6 @@ test("migration: an older branch_reviews table without attached_review_id opens 
   old.close();
   const db = openDb(path);
   assert.equal((db.prepare(`SELECT attached_review_id a FROM branch_reviews`).get() as { a: number | null }).a, null);
+  assert.equal((db.prepare(`SELECT skill_from s FROM branch_reviews`).get() as { s: string | null }).s, null, "skill_from added as NULL = own skill");
   assert.equal(oldestUnattachedBranchReviewAt(db, 1), RECENT);
 });

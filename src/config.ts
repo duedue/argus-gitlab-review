@@ -17,6 +17,7 @@ export interface Config {
   pollIntervalMs: number;
   ownerRef?: string; // ARGUS_OWNER: GitLab user id (all digits, preferred) or username that may bootstrap the owner on first OAuth login
   ownerEngineTestUsers: string[]; // M5 test whitelist: non-owners allowed to borrow the owner's CLI engine
+  skillFrom: boolean; // ARGUS_SKILL_FROM=on|off (default on): branch reviews may borrow another user's skill + thresholds (never their engine/tokens)
   jira: { url: string; token: () => string | undefined }; // requirement context (Jira Server/DC only); url "" = JIRA_URL unset = Jira context disabled
   web: { port: number; host: string; baseUrl: string; cookieSecure: boolean };
 }
@@ -60,6 +61,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     console.warn(`[config] unknown ARGUS_DEPLOY=${JSON.stringify(env.ARGUS_DEPLOY)}; using "local" (valid: compose, local)`);
   }
   const dryRunEnv = env.DRY_RUN?.trim() || undefined; // empty counts as unset
+  const skillFromEnv = env.ARGUS_SKILL_FROM?.trim().toLowerCase() || "on";
+  if (skillFromEnv !== "on" && skillFromEnv !== "off") {
+    console.warn(`[config] unknown ARGUS_SKILL_FROM=${JSON.stringify(env.ARGUS_SKILL_FROM)}; using "off" (valid: on, off)`); // a disable switch fails closed
+  }
   return {
     deploy,
     gitlabUrl: (env.GITLAB_URL ?? "").trim().replace(/\/+$/, ""),
@@ -74,6 +79,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     pollIntervalMs: pollSec * 1000,
     ownerRef: env.ARGUS_OWNER?.trim().replace(/^@/, "") || undefined,
     ownerEngineTestUsers: (env.OWNER_ENGINE_TEST_USERS ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+    skillFrom: skillFromEnv === "on",
     jira: { url: (env.JIRA_URL ?? "").trim().replace(/\/+$/, ""), token: () => jiraTokenFrom(env) },
     web: {
       port,

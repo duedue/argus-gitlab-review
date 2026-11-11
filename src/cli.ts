@@ -5,7 +5,7 @@ import { finishBranchReview, releaseStaleRunning, openDb } from "./db.ts";
 import { warnOwnerEngineTest } from "./engine.ts";
 import { GitLab } from "./gitlab.ts";
 import type { OAuthCtx } from "./oauth.ts";
-import { branchResultJson, resolveBranch, runBranchReview, saveBranchResult, startBranchRun, validBranchName, validProjectRef, type BranchResult } from "./branchreview.ts";
+import { branchResultJson, criteriaFor, resolveBranch, runBranchReview, saveBranchResult, startBranchRun, validBranchName, validProjectRef, type BranchResult } from "./branchreview.ts";
 import { parseHeadSha, reviewMr } from "./review.ts";
 import { pollCycle, pollLoop, runtimeFactory } from "./runtime.ts";
 import { applyStoredSettings, resetSetup, resolveOAuthCreds } from "./setup.ts";
@@ -19,8 +19,9 @@ const USAGE = `usage: cli.ts <command>
   once | loop
   review <project_id> <mr_iid> [--user <username>] [--head <sha>] [--engine <name>]
                                         (always dry-run; --head reviews the MR as of that commit; --engine overrides the user's engine for this run only)
-  review-branch <project_path_or_id> <branch> [--base <branch>] [--user <username>] [--engine <name>] [--json]
+  review-branch <project_path_or_id> <branch> [--base <branch>] [--user <username>] [--engine <name>] [--skill-from <username>] [--json]
                                         (pre-MR review against the merge-base with --base, default the project's default branch;
+                                         --skill-from reviews with that user's skill + thresholds but your engine and credentials;
                                          prints findings only: nothing is posted to GitLab, nothing is recorded)`;
 const die = (msg: string): never => {
   console.error(msg);
@@ -31,6 +32,7 @@ function formatBranchResult(r: BranchResult): string {
   const line = (f: BranchResult["findings"][number]) => `  [${f.severity}] ${f.file}${f.line ? `:${f.line}` : ""}  ${f.title} (confidence ${f.confidence})\n      ${f.body.replace(/\n/g, "\n      ")}`;
   return [
     `head ${r.head.slice(0, 10)}  base ${r.base}  merge-base ${r.mergeBase.slice(0, 10)}  ${r.lines} changed lines in ${r.files.length} file(s)`,
+    ...(r.skillFrom ? [`criteria: ${r.skillFrom}'s skill`] : []),
     ...(r.skipped ? [`skipped: ${r.skipped}`] : [`verdict: ${r.verdict}${r.model ? `  (${r.model})` : ""}`, ...(r.summary ? [r.summary] : [])]),
     ...(r.findings.length ? ["", `findings (${r.findings.length}):`, ...r.findings.map(line)] : []),
     ...(r.belowThreshold.length ? ["", `below your threshold (${r.belowThreshold.length}):`, ...r.belowThreshold.map(line)] : []),
@@ -123,7 +125,14 @@ if (cmd === "key" && sub === "init") {
     if (!user) die("no matching user (use --user <username>; see `user list`)");
     const engine = flag("--engine");
     if (engine !== undefined && !(ENGINES as readonly string[]).includes(engine)) die(`--engine must be one of ${ENGINES.join("|")}`);
-    const runUser = engine ? { ...user!, engine: engine as User["engine"] } : user!;
+    const engineUser = engine ? { ...user!, engine: engine as User["engine"] } : user!;
+    let crit: ReturnType<typeof criteriaFor>;
+    try {
+      crit = criteriaFor(cfg, db, engineUser, rest.includes("--skill-from") ? flag("--skill-from") ?? "" : undefined);
+    } catch (e) {
+      die(`--skill-from: ${(e as Error).message}`);
+    }
+    const { user: runUser, skillFrom } = crit!;
     // --json: stdout carries only the result, so route progress logs (e.g. [repo] fetch timing) to stderr.
     const write = process.stdout.write.bind(process.stdout);
     if (rest.includes("--json")) console.log = (...a: unknown[]) => console.error(...a);
@@ -132,9 +141,9 @@ if (cmd === "key" && sub === "init") {
     let res: BranchResult;
     try {
       const resolved = await resolveBranch(r, target);
-      const runId = startBranchRun(db, runUser.gitlabUserId, resolved, target, "cli");
+      const runId = startBranchRun(db, runUser.gitlabUserId, resolved, target, "cli", skillFrom);
       try {
-        res = await runBranchReview(cfg, runUser, r, target, resolved);
+        res = { ...(await runBranchReview(cfg, runUser, r, target, resolved)), skillFrom };
         saveBranchResult(db, runId, res);
       } catch (e) {
         finishBranchReview(db, runId, { error: "review_failed" });

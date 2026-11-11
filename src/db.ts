@@ -197,7 +197,10 @@ function addMissingColumns(db: Db): void {
       ["base_sha", "TEXT"], // diff_refs.base_sha this review diffed against; a change means the target was merged into the MR (NULL on older rows)
       ["mr_author", "TEXT"], // GitLab username of the MR author, for the history page; NULL on older rows
     ],
-    branch_reviews: [["attached_review_id", "INTEGER"]], // reviews.id of the MR review this branch review was attached to (NULL = not attached)
+    branch_reviews: [
+      ["attached_review_id", "INTEGER"], // reviews.id of the MR review this branch review was attached to (NULL = not attached)
+      ["skill_from", "TEXT"], // username whose skill + thresholds this review borrowed (engine/tokens stay the owner's); NULL = the owner's own skill
+    ],
     pushed_branches: [["attempts", "INTEGER NOT NULL DEFAULT 0"]], // transient failures on the current head (push trigger)
     auto_approvals: [["revoked_by", "TEXT"]],
     accepted_findings: [["announced", "INTEGER NOT NULL DEFAULT 0"], ["source", "TEXT NOT NULL DEFAULT 'reviewer'"]],
@@ -555,11 +558,12 @@ export interface BranchReviewRow {
   id: string; owner_id: number; project_id: number; project_path: string; branch: string; base: string; merge_base: string; head_sha: string;
   status: "queued" | "running" | "done" | "failed"; verdict: string | null; findings_json: string | null; summary: string | null; error: string | null;
   trigger: BranchReviewTrigger; created_at: number; finished_at: number | null;
+  skill_from: string | null; // borrowed criteria (see branchreview.ts criteriaFor); NULL = the owner's own skill
 }
 
-export function insertBranchReview(db: Db, r: Pick<BranchReviewRow, "id" | "owner_id" | "project_id" | "project_path" | "branch" | "base" | "merge_base" | "head_sha" | "trigger"> & { status?: "queued" | "running" }): void {
-  db.prepare(`INSERT INTO branch_reviews (id, owner_id, project_id, project_path, branch, base, merge_base, head_sha, status, trigger, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(r.id, r.owner_id, r.project_id, r.project_path, r.branch, r.base, r.merge_base, r.head_sha, r.status ?? "queued", r.trigger, Date.now());
+export function insertBranchReview(db: Db, r: Pick<BranchReviewRow, "id" | "owner_id" | "project_id" | "project_path" | "branch" | "base" | "merge_base" | "head_sha" | "trigger"> & { status?: "queued" | "running"; skill_from?: string | null }): void {
+  db.prepare(`INSERT INTO branch_reviews (id, owner_id, project_id, project_path, branch, base, merge_base, head_sha, status, trigger, created_at, skill_from) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(r.id, r.owner_id, r.project_id, r.project_path, r.branch, r.base, r.merge_base, r.head_sha, r.status ?? "queued", r.trigger, Date.now(), r.skill_from ?? null);
 }
 
 export const setBranchReviewRunning = (db: Db, id: string): void => void db.prepare(`UPDATE branch_reviews SET status='running' WHERE id=?`).run(id);
@@ -613,7 +617,7 @@ export const markBranchReviewAttached = (db: Db, branchReviewId: string, ownerId
  */
 export const ATTACH_MAX_LOOKBACK_MS = 14 * 86_400_000; // older reviews no longer open the gate (nor widen the authored-MR list)
 export function oldestUnattachedBranchReviewAt(db: Db, ownerId: number, now = Date.now()): number | undefined {
-  const r = db.prepare(`SELECT MIN(created_at) AS at FROM branch_reviews WHERE owner_id=? AND status='done' AND attached_review_id IS NULL AND verdict IS NOT NULL AND created_at > ?`).get(ownerId, now - ATTACH_MAX_LOOKBACK_MS) as { at: number | null };
+  const r = db.prepare(`SELECT MIN(created_at) AS at FROM branch_reviews WHERE owner_id=? AND status='done' AND attached_review_id IS NULL AND verdict IS NOT NULL AND skill_from IS NULL AND created_at > ?`).get(ownerId, now - ATTACH_MAX_LOOKBACK_MS) as { at: number | null };
   return r.at ?? undefined;
 }
 
@@ -629,4 +633,4 @@ export const pruneBranchReviews = (db: Db, now = Date.now()): number =>
 
 /** Latest done, attachable (has a verdict: a skipped run has none and must neither attach nor shadow a valid one) branch review of exactly this commit. */
 export const findDoneBranchReview = (db: Db, ownerId: number, projectId: number, headSha: string, base?: string): BranchReviewRow | undefined =>
-  db.prepare(`SELECT * FROM branch_reviews WHERE owner_id=? AND project_id=? AND head_sha=? AND status='done' AND verdict IS NOT NULL ${base === undefined ? "" : "AND base=?"} ORDER BY created_at DESC, id DESC LIMIT 1`).get(...(base === undefined ? [ownerId, projectId, headSha] : [ownerId, projectId, headSha, base])) as BranchReviewRow | undefined;
+  db.prepare(`SELECT * FROM branch_reviews WHERE owner_id=? AND project_id=? AND head_sha=? AND status='done' AND verdict IS NOT NULL AND skill_from IS NULL ${base === undefined ? "" : "AND base=?"} ORDER BY created_at DESC, id DESC LIMIT 1`).get(...(base === undefined ? [ownerId, projectId, headSha] : [ownerId, projectId, headSha, base])) as BranchReviewRow | undefined;
