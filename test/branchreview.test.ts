@@ -13,7 +13,8 @@ import type { ReviewEngine, ReviewInput } from "../src/engine.ts";
 import type { GitLab } from "../src/gitlab.ts";
 import { ReviewQueue } from "../src/queue.ts";
 import type { UserRuntime } from "../src/review.ts";
-import { addUser, getUser, type User } from "../src/users.ts";
+import { PUSH_DEBOUNCE_MS, branchStatus } from "../src/pushreview.ts";
+import { addUser, getUser, setUser, type User } from "../src/users.ts";
 import { createApp } from "../src/web/app.tsx";
 
 const GL = "https://gl.test";
@@ -40,12 +41,15 @@ function repo() {
   return { url: `file://${src}`, m1, head: g("rev-parse", "HEAD"), rev: (r: string) => g("rev-parse", r), mergeBase: (a: string, b: string) => g("merge-base", a, b) };
 }
 
+let openMrs = 0; // open MRs the fake GitLab reports for any branch
+let mrsFail = false; // listBranchMrs rejects
 const forbidden = () => assert.fail("a branch review must not write to GitLab");
 function fakeGl(r: ReturnType<typeof repo>, calls: string[] = []) {
   return {
     getProject: async (id: number | string) => { calls.push(`project ${id}`); if (id === "no/such") throw Object.assign(new Error("nf"), { status: 404 }); return { id: 9, http_url_to_repo: r.url, path_with_namespace: "g/p", default_branch: "main" }; },
     getBranchSha: async (_: number, b: string) => { calls.push(`branch ${b}`); if (b === "nope") throw Object.assign(new Error("nf"), { status: 404 }); return r.rev(b); },
     getMergeBase: async (_: number, a: string, b: string) => { calls.push("merge-base"); return r.mergeBase(a, b); },
+    listBranchMrs: async () => { if (mrsFail) throw new Error("gitlab 500"); return Array.from({ length: openMrs }, (_, i) => ({ iid: i + 1 })); },
     postNote: forbidden, postDiscussion: forbidden, replyDiscussion: forbidden, resolveDiscussion: forbidden, approveMr: forbidden, unapproveMr: forbidden,
   } as unknown as GitLab;
 }
@@ -109,13 +113,13 @@ test("branch review: explicit base, skip reasons, validators", async () => {
   for (const bad of ["", "g", "../x", "g/p;rm", "g//p", 5]) assert.ok(!validProjectRef(bad), String(bad));
 });
 
-function api(opts: { limit?: number; attempts?: number } = {}) {
+function api(opts: { limit?: number; attempts?: number; status?: number } = {}) {
   const r = repo();
   const { cfg, db } = setup();
   const seen: ReviewInput[] = [];
   const queue = new ReviewQueue();
   const runtimeFor = async (_u: User) => ({ ...mkRt(r, seen) });
-  const app = createApp({ cfg, db, key, oauth: { gitlabUrl: GL, redirectUri: "x", clientId: "c", clientSecret: "s" }, runtimeFor, queue, triggerLimitPerHour: opts.limit, branchAttemptsPerHour: opts.attempts });
+  const app = createApp({ cfg, db, key, oauth: { gitlabUrl: GL, redirectUri: "x", clientId: "c", clientSecret: "s" }, runtimeFor, queue, triggerLimitPerHour: opts.limit, branchAttemptsPerHour: opts.attempts, branchStatusPerHour: opts.status });
   const apiKey = createApiKey(db, 1);
   const post = (body: unknown, auth: string | null = `Bearer ${apiKey}`) =>
     app.request("/api/review-branch", { method: "POST", headers: { "content-type": "application/json", ...(auth ? { authorization: auth } : {}) }, body: typeof body === "string" ? body : JSON.stringify(body) });
@@ -344,4 +348,161 @@ test("findDoneBranchReview filters base in SQL: an older row with the right base
   assert.equal(findDoneBranchReview(db, 1, 9, "h")?.id, "new");
   assert.equal(findDoneBranchReview(db, 1, 9, "h", "main")?.id, "old");
   assert.equal(findDoneBranchReview(db, 1, 9, "h", "other"), undefined);
+});
+
+// --- GET /api/branch-status ---
+function statusApi(opts: { attempts?: number; status?: number; settings?: string[] } = {}) {
+  openMrs = 0; mrsFail = false;
+  const t = api({ attempts: opts.attempts, status: opts.status });
+  if (opts.settings) setUser(t.db, "caller", opts.settings);
+  const key1 = createApiKey(t.db, 1);
+  const get = (q: string, auth: string | null = `Bearer ${key1}`) => t.app.request(`/api/branch-status?${q}`, { headers: auth ? { authorization: auth } : {} });
+  const q = "project=g/p&branch=feat";
+  const json = async (qs = q) => (await (await get(qs)).json()) as { head: string; base: string; review: { id: string; status: string; trigger: string } | null; push: { opted_in: boolean; handled: boolean; due_at: number; waiting_reason?: string } | null; advice: string };
+  const ins = (id: string, status: "queued" | "running" | "done" | "failed", head: string, trigger: "api" | "push" = "api", base = "main") => {
+    insertBranchReview(t.db, { id, owner_id: 1, project_id: 9, project_path: "g/p", branch: "feat", base, merge_base: "m", head_sha: head, trigger });
+    if (status === "done") finishBranchReview(t.db, id, { verdict: "approve", findingsJson: JSON.stringify({ findings: [1], belowThreshold: [1, 2], skipped: undefined }) });
+    else if (status === "failed") finishBranchReview(t.db, id, { error: "review_failed" });
+    else if (status === "running") t.db.prepare(`UPDATE branch_reviews SET status='running' WHERE id=?`).run(id);
+  };
+  const push = (head: string, pushedAt: number, handled: string | null = null) =>
+    t.db.prepare(`INSERT OR REPLACE INTO pushed_branches (owner_id, project_id, branch, head_sha, pushed_at, handled_sha) VALUES (1,9,'feat',?,?,?)`).run(head, pushedAt, handled);
+  return { ...t, key: key1, get, json, ins, push, q };
+}
+const OPT = ["review_pushed_branches=1", "review_all_projects=1"];
+
+test("status: auth, validation, 404, no review and not opted in -> submit", async () => {
+  const t = statusApi();
+  assert.equal((await t.get(t.q, null)).status, 401);
+  assert.equal((await t.get(t.q, "Bearer argus_bad")).status, 401);
+  for (const [qs, err] of [["branch=feat", "invalid_project"], ["project=g/p", "invalid_branch"], ["project=g/p&branch=a..b", "invalid_branch"], ["project=g/p&branch=feat&base=-x", "invalid_base"]] as const) {
+    const res = await t.get(qs);
+    assert.equal(res.status, 400, qs);
+    assert.equal(((await res.json()) as { error: string }).error, err);
+  }
+  assert.equal((await t.get("project=no/such&branch=feat")).status, 404);
+  assert.equal((await t.get("project=g/p&branch=nope")).status, 404);
+  assert.equal((await t.get("project=g/p&branch=feat&base=nope")).status, 404);
+  const s = await t.json();
+  assert.deepEqual([s.head, s.base, s.review, s.push, s.advice], [t.r.head, "main", null, null, "submit"]);
+  assert.equal((t.db.prepare(`SELECT COUNT(*) n FROM branch_reviews`).get() as { n: number }).n, 0, "read-only");
+});
+
+test("status: review of this head -> done (done and failed), running (queued/running); other head/base/owner ignored", async () => {
+  const t = statusApi();
+  t.ins("other-head", "done", "z".repeat(40));
+  t.ins("other-base", "done", t.r.head, "api", "feat");
+  assert.equal((await t.json()).advice, "submit");
+  t.ins("f", "failed", t.r.head);
+  assert.equal((await t.json()).advice, "done");
+  t.ins("q", "queued", t.r.head);
+  t.db.prepare(`UPDATE branch_reviews SET created_at=created_at+10 WHERE id='q'`).run();
+  const s = await t.json();
+  assert.deepEqual([s.advice, s.review?.id, s.review?.status], ["running", "q", "queued"], "newest row wins");
+  t.db.prepare(`DELETE FROM branch_reviews WHERE id IN ('q','f')`).run();
+  t.ins("d", "done", t.r.head, "push");
+  const done = (await t.json()) as unknown as { advice: string; review: { findings_count: number; below_threshold_count: number; trigger: string } };
+  assert.deepEqual([done.advice, done.review.findings_count, done.review.below_threshold_count, done.review.trigger], ["done", 1, 2, "push"]);
+  assert.equal((await t.json("project=g/p&branch=feat&base=feat")).advice, "done", "explicit base selects that base's row");
+  t.db.prepare(`UPDATE branch_reviews SET owner_id=2`).run();
+  assert.equal((await t.json()).advice, "submit", "owner-scoped");
+});
+
+test("status: pending_push window, handled, cap, opt-in, stale head", async () => {
+  const t = statusApi({ settings: OPT });
+  const now = Date.now();
+  const poll = loadConfig({ DATA_DIR: "x", GITLAB_URL: GL }).pollIntervalMs;
+  const due = (ageMs: number) => t.push(t.r.head, now - ageMs);
+  due(60_000); // pushed 1 min ago: debounce running
+  let s = await t.json();
+  assert.deepEqual([s.advice, s.push?.opted_in, s.push?.handled, s.push?.waiting_reason], ["pending_push", true, false, "debounce"]);
+  assert.equal(s.push?.due_at, now - 60_000 + PUSH_DEBOUNCE_MS);
+  due(PUSH_DEBOUNCE_MS + poll); // past due, within 2 poll cycles
+  s = await t.json();
+  assert.deepEqual([s.advice, s.push?.waiting_reason], ["pending_push", "awaiting_poll"]);
+  due(PUSH_DEBOUNCE_MS + 2 * poll + 5_000); // poller should have acted
+  assert.equal((await t.json()).advice, "submit");
+  t.push(t.r.head, now - 60_000, t.r.head); // handled but no row (e.g. skipped): nothing is coming
+  s = await t.json();
+  assert.deepEqual([s.advice, s.push?.handled], ["submit", true]);
+  t.push("z".repeat(40), now - 60_000); // push row is for another head
+  assert.equal((await t.json()).advice, "submit");
+  due(60_000);
+  for (let i = 0; i < 20; i++) t.ins(`c${i}`, "done", `h${i}`, "push"); // cap 20 exhausted (rows for other heads)
+  s = await t.json();
+  assert.deepEqual([s.advice, s.push?.waiting_reason], ["submit", undefined]);
+  t.db.prepare(`DELETE FROM branch_reviews`).run();
+  setUser(t.db, "caller", ["review_pushed_branches=0"]);
+  s = await t.json();
+  assert.deepEqual([s.advice, s.push], ["submit", null], "not opted in: push row ignored");
+});
+
+test("status: pending_push only when the poller would take it (default branch, open MR, base, project list)", async () => {
+  const t = statusApi({ settings: OPT });
+  const now = Date.now();
+  t.push(t.r.head, now - 60_000);
+  assert.equal((await t.json()).advice, "pending_push");
+  openMrs = 1;
+  let s = await t.json();
+  assert.deepEqual([s.advice, s.push?.waiting_reason], ["submit", undefined], "open MR: the normal MR review owns it");
+  openMrs = 0;
+  assert.equal((await t.json("project=g/p&branch=feat&base=feat")).advice, "submit", "base is not the default branch");
+  setUser(t.db, "caller", ["review_all_projects=0", "review_projects=other/proj"]);
+  assert.equal((await t.json()).advice, "submit", "project not in the review list");
+  setUser(t.db, "caller", ["review_all_projects=1"]);
+  t.db.prepare(`UPDATE pushed_branches SET branch='main', head_sha=?`).run(t.r.rev("main"));
+  assert.equal((await t.json("project=g/p&branch=main")).advice, "submit", "default branch is never push-reviewed");
+});
+
+test("status: MR lookup failure, missing skill or engine -> submit (never 500, never wait forever)", async () => {
+  const t = statusApi({ settings: OPT });
+  t.push(t.r.head, Date.now() - 60_000);
+  assert.equal((await t.json()).advice, "pending_push");
+  mrsFail = true;
+  const res = await t.get(t.q);
+  assert.equal(res.status, 200);
+  const s = (await res.json()) as { advice: string; push: { waiting_reason?: string } };
+  assert.deepEqual([s.advice, s.push.waiting_reason], ["submit", undefined]);
+  mrsFail = false;
+  const u = getUser(t.db, "caller")!;
+  const rt = mkRt(t.r, []);
+  const tgt = { projectId: 9, projectPath: "g/p", defaultBranch: "main", branch: "feat", base: "main", head: t.r.head };
+  assert.equal((await branchStatus(t.db, loadConfig({ DATA_DIR: "x", GITLAB_URL: GL }), u, rt, tgt)).advice, "pending_push");
+  assert.equal((await branchStatus(t.db, loadConfig({ DATA_DIR: "x", GITLAB_URL: GL }), { ...u, skillPath: null as unknown as string }, rt, tgt)).advice, "submit", "no skill");
+  assert.equal((await branchStatus(t.db, loadConfig({ DATA_DIR: "x", GITLAB_URL: GL }), u, { ...rt, engine: undefined }, tgt)).advice, "submit", "no engine");
+});
+
+test("status: only project + head (+ explicit base) are looked up; no merge-base", async () => {
+  const t = statusApi();
+  const calls: string[] = [];
+  const r = t.r;
+  const rt = mkRt(r, [], calls);
+  const app = createApp({ cfg: loadConfig({ DATA_DIR: mkdtempSync(join(tmpdir(), "t-")), GITLAB_URL: GL }), db: t.db, key, oauth: { gitlabUrl: GL, redirectUri: "x", clientId: "c", clientSecret: "s" }, runtimeFor: async () => rt, queue: new ReviewQueue() });
+  const res = await app.request("/api/branch-status?project=g/p&branch=feat", { headers: { authorization: `Bearer ${t.key}` } });
+  assert.equal(res.status, 200);
+  assert.deepEqual(calls, ["project g/p", "branch feat"]);
+  calls.length = 0;
+  await app.request("/api/branch-status?project=g/p&branch=feat&base=main", { headers: { authorization: `Bearer ${t.key}` } });
+  assert.deepEqual(calls, ["project g/p", "branch feat", "branch main"]);
+});
+
+test("status: has its own limiter (429 + Retry-After) and never uses up the POST attempt limiter", async () => {
+  const t = statusApi({ attempts: 2, status: 2 });
+  assert.equal((await t.get(t.q)).status, 200);
+  assert.equal((await t.get(t.q)).status, 200);
+  const third = await t.get(t.q);
+  assert.equal(third.status, 429);
+  assert.equal(third.headers.get("retry-after"), "3600");
+  const post = await t.app.request("/api/review-branch", { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${t.key}` }, body: JSON.stringify({ project: "g/p", branch: "feat" }) });
+  assert.equal(post.status, 202, "status polling did not consume the submit budget");
+  await t.queue.idle();
+});
+
+test("storedSummary tolerates a corrupt findings_json (status and list do not 500)", async () => {
+  const t = statusApi();
+  t.ins("bad", "done", t.r.head);
+  t.db.prepare(`UPDATE branch_reviews SET findings_json='{not json'`).run();
+  const s = (await t.json()) as unknown as { advice: string; review: { findings_count: number | null } };
+  assert.deepEqual([s.advice, s.review.findings_count], ["done", null]);
+  assert.equal((await t.app.request("/api/branch-reviews", { headers: { authorization: `Bearer ${t.key}` } })).status, 200);
 });

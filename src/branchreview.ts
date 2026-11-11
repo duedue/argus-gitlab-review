@@ -50,24 +50,41 @@ export const validProjectRef = (s: unknown): s is string => typeof s === "string
 
 interface Resolved { projectId: number; projectPath: string; repoUrl: string; head: string; base: string; mergeBase: string }
 
-/** Cheap GitLab lookups with the caller's token (also proves they can see the project). Throws BranchError. */
-export async function resolveBranch(rt: UserRuntime, t: BranchTarget): Promise<Resolved> {
-  const status = (e: unknown) => (e as { status?: number }).status;
-  const fail = (e: unknown, code: string): never => {
-    const s = status(e);
-    if (s === 404 || s === 403) throw new BranchError(404, code);
-    if (s === 401) throw new BranchError(401, "caller_token_invalid");
-    console.error("[branch-review] GitLab lookup failed:", (e as Error).message);
-    throw new BranchError(502, "gitlab_error");
-  };
-  const project = await rt.gl.getProject(t.project).catch((e) => fail(e, "project_not_found"));
+const glFail = (e: unknown, code: string): never => {
+  const s = (e as { status?: number }).status;
+  if (s === 404 || s === 403) throw new BranchError(404, code);
+  if (s === 401) throw new BranchError(401, "caller_token_invalid");
+  console.error("[branch-review] GitLab lookup failed:", (e as Error).message);
+  throw new BranchError(502, "gitlab_error");
+};
+
+/** Project + branch head with the caller's token (also proves they can see the project); no merge-base. Throws BranchError. */
+export async function resolveHead(rt: UserRuntime, t: BranchTarget, verifyExplicitBase = false) {
+  const project = await rt.gl.getProject(t.project).catch((e) => glFail(e, "project_not_found"));
   const base = t.base ?? project.default_branch;
   if (!base) throw new BranchError(400, "base_unknown");
-  const head = await rt.gl.getBranchSha(project.id, t.branch).catch((e) => fail(e, "branch_not_found"));
-  const baseSha = await rt.gl.getBranchSha(project.id, base).catch((e) => fail(e, "base_not_found"));
+  const head = await rt.gl.getBranchSha(project.id, t.branch).catch((e) => glFail(e, "branch_not_found"));
+  if (verifyExplicitBase && t.base) await rt.gl.getBranchSha(project.id, t.base).catch((e) => glFail(e, "base_not_found"));
+  return { project, base, head };
+}
+
+/** Cheap GitLab lookups with the caller's token. Throws BranchError. */
+export async function resolveBranch(rt: UserRuntime, t: BranchTarget): Promise<Resolved> {
+  const { project, base, head } = await resolveHead(rt, t);
+  const baseSha = await rt.gl.getBranchSha(project.id, base).catch((e) => glFail(e, "base_not_found"));
   // Never `base..head` from the target tip: target commits merged into the branch would inflate the diff.
-  const mergeBase = await rt.gl.getMergeBase(project.id, baseSha, head).catch((e) => fail(e, "merge_base_not_found"));
+  const mergeBase = await rt.gl.getMergeBase(project.id, baseSha, head).catch((e) => glFail(e, "merge_base_not_found"));
   return { projectId: project.id, projectPath: project.path_with_namespace, repoUrl: project.http_url_to_repo, head, base, mergeBase };
+}
+
+/** Counts and skip reason of a stored findings_json; tolerant of a corrupt or missing row. */
+export function storedSummary(json: string | null): { findings_count: number | null; below_threshold_count: number | null; skipped: string | null } {
+  try {
+    const s = json ? (JSON.parse(json) as { findings?: unknown[]; belowThreshold?: unknown[]; skipped?: string }) : undefined;
+    return { findings_count: s?.findings?.length ?? null, below_threshold_count: s?.belowThreshold?.length ?? null, skipped: s?.skipped ?? null };
+  } catch {
+    return { findings_count: null, below_threshold_count: null, skipped: null };
+  }
 }
 
 /** Runs the review of an already-resolved target. Writes nothing to GitLab or the database. */
