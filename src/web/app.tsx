@@ -21,7 +21,7 @@ import { parseProjectList, reviewAllowed } from "../projects.ts";
 import { isDraft } from "../gitlab.ts";
 import { chooseEngine, laneFor } from "../engine.ts";
 import type { Finding } from "../findings.ts";
-import { findAttachedMr, getBranchReviewById, listBranchReviews, type BranchReviewRow } from "../db.ts";
+import { attachedMrs, getBranchReviewById, listBranchReviews, type BranchReviewRow } from "../db.ts";
 import { BranchError, branchResultJson, getBranchJob, startBranchReview, validBranchName, validProjectRef } from "../branchreview.ts";
 import { makeRateLimiter, parseMrUrl, TRIGGER_LIMIT_PER_HOUR, triggerReviews, TriggerError } from "../trigger.ts";
 import { DOCS, loadDocs, type DocKey } from "./docs.ts";
@@ -333,7 +333,7 @@ export function createApp({
     const pairs = [`severity_threshold=${str("severity_threshold")}`, `confidence_threshold=${str("confidence_threshold")}`, `language=${str("language").trim()}`, `auto_approve=${str("auto_approve") === "1" ? 1 : 0}`, `review_assigned=${str("review_assigned") === "1" ? 1 : 0}`, `max_diff_lines=${str("max_diff_lines").trim()}`, `review_all_projects=${str("review_all_projects") === "1" ? 1 : 0}`, `review_pushed_branches=${str("review_pushed_branches") === "1" ? 1 : 0}`];
     // The select is disabled for codex-cli users (not submitted): an absent field keeps the stored value instead of clearing it.
     if (typeof body.model === "string") pairs.push(`model=${body.model}`);
-    if (typeof body.branch_daily_cap === "string") pairs.push(`branch_daily_cap=${body.branch_daily_cap.trim()}`);
+    if (typeof body.branch_daily_cap === "string" && body.branch_daily_cap.trim()) pairs.push(`branch_daily_cap=${body.branch_daily_cap.trim()}`);
     const pasted = str("skill_text").replace(/\r\n/g, "\n"); // browsers submit CRLF
     const f = body.skill_file; // string when no file part was sent
     // An empty file input arrives as a 0-byte file. A chosen file wins over the pasted text (which is prefilled
@@ -455,7 +455,7 @@ export function createApp({
   app.get("/api/branch-reviews", (c) => {
     const auth = apiCaller(c, false);
     if ("res" in auth) return auth.res;
-    const limit = Math.min(Math.max(Number(c.req.query("limit")) || 20, 1), 100);
+    const limit = Math.min(Math.max(Math.trunc(Number(c.req.query("limit"))) || 20, 1), 100);
     const cur = c.req.query("before");
     const m = cur === undefined ? null : /^(\d{1,16}):([0-9a-f-]{36})$/.exec(cur);
     if (cur !== undefined && !m) return c.json({ error: "invalid_cursor" }, 400);
@@ -476,9 +476,9 @@ export function createApp({
   });
 
   // --- review history ---
-  const branchView = (r: BranchReviewRow): BranchRowView => {
+  const branchView = (r: BranchReviewRow, mr: { mr_iid: number; mr_url: string | null } | undefined): BranchRowView => {
+    // Parses the stored JSON only to count; fine at page size (20-100 rows). Store the counts in columns if lists get large.
     const stored = r.findings_json ? (JSON.parse(r.findings_json) as { findings?: unknown[]; belowThreshold?: unknown[]; skipped?: string }) : undefined;
-    const mr = findAttachedMr(db, r.owner_id, r.project_id, r.head_sha);
     return {
       id: r.id, createdAt: r.created_at, project: r.project_path, projectUrl: `${cfg.gitlabUrl}/${r.project_path}`, branch: r.branch, base: r.base, mergeBase: r.merge_base, head: r.head_sha,
       verdict: r.verdict, findings: stored?.findings?.length ?? null, below: stored?.belowThreshold?.length ?? null, trigger: r.trigger, status: r.status, error: r.error, skipped: stored?.skipped ?? null,
@@ -522,8 +522,9 @@ export function createApp({
     const BRANCH_PAGE = 20;
     const found = listBranchReviews(db, u.gitlabUserId, { limit: BRANCH_PAGE + 1, before: m ? { createdAt: Number(m[1]), id: m[2]! } : undefined });
     const shown = found.slice(0, BRANCH_PAGE);
+    const attached = attachedMrs(db, u.gitlabUserId, shown.map((r) => r.id));
     const last = shown[shown.length - 1];
-    return page(c, <ReviewsPage user={u} csrf={c.get("csrf")} rows={rows} notice={notice} tab="branch" branch={{ rows: shown.map(branchView), next: found.length > BRANCH_PAGE && last ? `${last.created_at}:${last.id}` : null }} />);
+    return page(c, <ReviewsPage user={u} csrf={c.get("csrf")} rows={rows} notice={notice} tab="branch" branch={{ rows: shown.map((r) => branchView(r, attached.get(r.id))), next: found.length > BRANCH_PAGE && last ? `${last.created_at}:${last.id}` : null }} />);
   });
 
   // Branch review detail: only the row's owner or the Argus owner; anyone else gets the same 404 as a missing row.
@@ -532,7 +533,7 @@ export function createApp({
     const row = getBranchReviewById(db, c.req.param("id") ?? "");
     if (!row || (row.owner_id !== u.gitlabUserId && !u.isOwner)) return page(c, <MessagePage title="找不到" message="沒有這筆 branch 審查紀錄。" user={u} csrf={c.get("csrf")} />, 404);
     const stored = row.findings_json ? (JSON.parse(row.findings_json) as { findings?: Finding[]; belowThreshold?: Finding[] }) : {};
-    return page(c, <BranchReviewPage user={u} csrf={c.get("csrf")} r={branchView(row)} summary={row.summary} findings={stored.findings ?? []} below={stored.belowThreshold ?? []} ownerName={row.owner_id === u.gitlabUserId ? undefined : getUserById(db, row.owner_id)?.username} />);
+    return page(c, <BranchReviewPage user={u} csrf={c.get("csrf")} r={branchView(row, attachedMrs(db, row.owner_id, [row.id]).get(row.id))} summary={row.summary} findings={stored.findings ?? []} below={stored.belowThreshold ?? []} ownerName={row.owner_id === u.gitlabUserId ? undefined : getUserById(db, row.owner_id)?.username} />);
   });
 
   // Manual re-review of a failed row: resets attempts, releases the row and queues the MR's current head at once.

@@ -17,6 +17,11 @@ export class ReviewQueue {
     if (!Number.isInteger(limit) || limit < 1) throw new Error("queue concurrency must be an integer >= 1");
   }
 
+  /** True while anything is queued or running in this lane. */
+  laneBusy(lane: number): boolean {
+    return this.lanes.has(lane);
+  }
+
   has(key: string): boolean {
     return this.pending.has(key);
   }

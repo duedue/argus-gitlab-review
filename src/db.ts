@@ -160,6 +160,8 @@ export function openDb(path: string): Db {
     );
   `);
   addMissingColumns(db);
+  // After the columns exist (an older DB gets attached_review_id from addMissingColumns).
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_branch_reviews_unattached ON branch_reviews (owner_id, created_at) WHERE status='done' AND attached_review_id IS NULL`);
   return db;
 }
 
@@ -194,6 +196,8 @@ function addMissingColumns(db: Db): void {
       ["base_sha", "TEXT"], // diff_refs.base_sha this review diffed against; a change means the target was merged into the MR (NULL on older rows)
       ["mr_author", "TEXT"], // GitLab username of the MR author, for the history page; NULL on older rows
     ],
+    branch_reviews: [["attached_review_id", "INTEGER"]], // reviews.id of the MR review this branch review was attached to (NULL = not attached)
+    pushed_branches: [["attempts", "INTEGER NOT NULL DEFAULT 0"]], // transient failures on the current head (push trigger)
     auto_approvals: [["revoked_by", "TEXT"]],
     accepted_findings: [["announced", "INTEGER NOT NULL DEFAULT 0"]],
   };
@@ -560,12 +564,17 @@ export function finishBranchReview(db: Db, id: string, r: { error: string } | { 
 export const getBranchReview = (db: Db, ownerId: number, id: string): BranchReviewRow | undefined =>
   db.prepare(`SELECT * FROM branch_reviews WHERE id=? AND owner_id=?`).get(id, ownerId) as BranchReviewRow | undefined;
 
+/**
+ * The owner's active queued job, for the single-active rule. CLI runs never count: they bypass the queue, so a killed
+ * run would leave a 'running' row nobody ends (failStaleCliBranchReviews cleans those up). Queued rows always get
+ * finished by the queue, and a restart marks leftovers interrupted, so no age bound applies.
+ */
 export const activeBranchReview = (db: Db, ownerId: number): BranchReviewRow | undefined =>
-  db.prepare(`SELECT * FROM branch_reviews WHERE owner_id=? AND status IN ('queued','running') ORDER BY created_at LIMIT 1`).get(ownerId) as BranchReviewRow | undefined;
+  db.prepare(`SELECT * FROM branch_reviews WHERE owner_id=? AND status IN ('queued','running') AND trigger != 'cli' ORDER BY created_at LIMIT 1`).get(ownerId) as BranchReviewRow | undefined;
 
 /** The owner's branch reviews, newest first. Keyset pagination: pass the last row's `created_at`+`id` as `before` for the next page. */
 export function listBranchReviews(db: Db, ownerId: number, opts: { limit?: number; before?: { createdAt: number; id: string } } = {}): BranchReviewRow[] {
-  const limit = Math.min(Math.max(opts.limit ?? 20, 1), 100);
+  const limit = Math.min(Math.max(Math.trunc(opts.limit ?? 20) || 20, 1), 101); // 101 = the API pages of 100 plus one to detect "has more"
   const b = opts.before;
   return db.prepare(`SELECT * FROM branch_reviews WHERE owner_id=? ${b ? "AND (created_at < ? OR (created_at = ? AND id < ?))" : ""} ORDER BY created_at DESC, id DESC LIMIT ?`)
     .all(...(b ? [ownerId, b.createdAt, b.createdAt, b.id, limit] : [ownerId, limit])) as BranchReviewRow[];
@@ -575,15 +584,40 @@ export function listBranchReviews(db: Db, ownerId: number, opts: { limit?: numbe
 export const getBranchReviewById = (db: Db, id: string): BranchReviewRow | undefined =>
   db.prepare(`SELECT * FROM branch_reviews WHERE id=?`).get(id) as BranchReviewRow | undefined;
 
-/** The MR review row created for the same owner/project/commit (a branch review attached on MR open), newest first. */
-export const findAttachedMr = (db: Db, ownerId: number, projectId: number, headSha: string): { mr_iid: number; mr_url: string | null } | undefined =>
-  db.prepare(`SELECT mr_iid, mr_url FROM reviews WHERE owner_id=? AND project_id=? AND head_sha=? ORDER BY id DESC LIMIT 1`).get(ownerId, projectId, headSha) as { mr_iid: number; mr_url: string | null } | undefined;
+/** Attached MR review of each given branch review (branch_reviews.attached_review_id -> reviews), keyed by branch review id; one indexed query for a page. */
+export function attachedMrs(db: Db, ownerId: number, ids: string[]): Map<string, { mr_iid: number; mr_url: string | null }> {
+  const out = new Map<string, { mr_iid: number; mr_url: string | null }>();
+  if (!ids.length) return out;
+  const rows = db.prepare(`SELECT b.id AS bid, r.mr_iid, r.mr_url FROM branch_reviews b JOIN reviews r ON r.id=b.attached_review_id WHERE b.owner_id=? AND b.id IN (${ids.map(() => "?").join(",")})`).all(ownerId, ...ids) as { bid: string; mr_iid: number; mr_url: string | null }[];
+  for (const r of rows) out.set(r.bid, { mr_iid: r.mr_iid, mr_url: r.mr_url });
+  return out;
+}
+export const findAttachedMr = (db: Db, ownerId: number, branchReviewId: string) => attachedMrs(db, ownerId, [branchReviewId]).get(branchReviewId);
+
+/** Records that this branch review was posted as the review of the MR row (owner, mr, head). Not for dry-run rows (nothing was posted: a later live run must still attach). Call right after that row is finished. */
+export const markBranchReviewAttached = (db: Db, branchReviewId: string, ownerId: number, mrId: number, headSha: string): void =>
+  void db.prepare(`UPDATE branch_reviews SET attached_review_id=(SELECT id FROM reviews WHERE owner_id=? AND mr_id=? AND head_sha=? AND dry_run=0) WHERE id=?`).run(ownerId, mrId, headSha, branchReviewId);
+
+/**
+ * created_at (epoch ms) of the oldest done, attachable (it has a verdict: skipped runs have none) branch review that no MR
+ * has picked up yet and is at most 14 days old; undefined = nothing left to attach. Plain lookup on the partial index idx_branch_reviews_unattached.
+ */
+export const ATTACH_MAX_LOOKBACK_MS = 14 * 86_400_000; // older reviews no longer open the gate (nor widen the authored-MR list)
+export function oldestUnattachedBranchReviewAt(db: Db, ownerId: number, now = Date.now()): number | undefined {
+  const r = db.prepare(`SELECT MIN(created_at) AS at FROM branch_reviews WHERE owner_id=? AND status='done' AND attached_review_id IS NULL AND verdict IS NOT NULL AND created_at > ?`).get(ownerId, now - ATTACH_MAX_LOOKBACK_MS) as { at: number | null };
+  return r.at ?? undefined;
+}
+
+export const CLI_RUN_STALE_MS = 20 * 60_000; // longest engine run (15 min) + slack
+/** A CLI run still 'running' after this long was killed: show it as failed instead of running forever. */
+export const failStaleCliBranchReviews = (db: Db, now = Date.now()): number =>
+  db.prepare(`UPDATE branch_reviews SET status='failed', error='interrupted', finished_at=? WHERE trigger='cli' AND status IN ('queued','running') AND created_at < ?`).run(now, now - CLI_RUN_STALE_MS).changes;
 
 export const BRANCH_REVIEW_RETENTION_MS = 90 * 24 * 3_600_000;
 /** Deletes finished branch reviews older than the retention window (queued/running rows are never touched). Returns the count. */
 export const pruneBranchReviews = (db: Db, now = Date.now()): number =>
   db.prepare(`DELETE FROM branch_reviews WHERE status IN ('done','failed') AND COALESCE(finished_at, created_at) < ?`).run(now - BRANCH_REVIEW_RETENTION_MS).changes;
 
-/** Latest finished (done) branch review of exactly this commit. */
-export const findDoneBranchReview = (db: Db, ownerId: number, projectId: number, headSha: string): BranchReviewRow | undefined =>
-  db.prepare(`SELECT * FROM branch_reviews WHERE owner_id=? AND project_id=? AND head_sha=? AND status='done' ORDER BY created_at DESC, id DESC LIMIT 1`).get(ownerId, projectId, headSha) as BranchReviewRow | undefined;
+/** Latest done, attachable (has a verdict: a skipped run has none and must neither attach nor shadow a valid one) branch review of exactly this commit. */
+export const findDoneBranchReview = (db: Db, ownerId: number, projectId: number, headSha: string, base?: string): BranchReviewRow | undefined =>
+  db.prepare(`SELECT * FROM branch_reviews WHERE owner_id=? AND project_id=? AND head_sha=? AND status='done' AND verdict IS NOT NULL ${base === undefined ? "" : "AND base=?"} ORDER BY created_at DESC, id DESC LIMIT 1`).get(...(base === undefined ? [ownerId, projectId, headSha] : [ownerId, projectId, headSha, base])) as BranchReviewRow | undefined;

@@ -546,7 +546,12 @@ test("reviews: branch tab is a query param, MR tab stays default, rows link to c
   assert.match(empty, /尚無 branch 審查紀錄/);
   assert.match(empty, /href="\/docs\/guide"/);
   seedBranch(db, 7, "11111111-1111-1111-1111-111111111111", "abcdef1234567890");
-  db.prepare(`INSERT INTO reviews (owner_id, project_id, mr_id, mr_iid, head_sha, dry_run, status, mr_url) VALUES (7, 9, 500, 42, 'abcdef1234567890', 1, 'done', ?)`).run(`${GL}/g/p/-/merge_requests/42`);
+  // A normal review of the same head (no attach marker) must not produce the link...
+  db.prepare(`INSERT INTO reviews (owner_id, project_id, mr_id, mr_iid, head_sha, dry_run, status, mr_url) VALUES (7, 9, 501, 43, 'abcdef1234567890', 0, 'done', ?)`).run(`${GL}/g/p/-/merge_requests/43`);
+  assert.ok(!/→ !43/.test(await get("?tab=branch")));
+  // ...only the row that recorded this branch review does.
+  const rid = db.prepare(`INSERT INTO reviews (owner_id, project_id, mr_id, mr_iid, head_sha, dry_run, status, mr_url) VALUES (7, 9, 500, 42, 'abcdef1234567890', 1, 'done', ?)`).run(`${GL}/g/p/-/merge_requests/42`).lastInsertRowid;
+  db.prepare(`UPDATE branch_reviews SET attached_review_id=? WHERE id='11111111-1111-1111-1111-111111111111'`).run(rid);
   const html = await get("?tab=branch");
   assert.match(html, /建議修改/);
   assert.match(html, /href="https:\/\/gl\.test\/g\/p\/-\/compare\/mb123456789\.\.\.abcdef1234567890"/);
@@ -598,4 +603,6 @@ test("settings: branch_daily_cap field renders default, saves, rejects out-of-ra
   assert.equal((await postSettings(app, s, {})).status, 200); // absent cap keeps its value; unchecked box turns the option off
   assert.equal(getUserById(db, 7)!.branchDailyCap, 0);
   assert.equal(getUserById(db, 7)!.reviewPushedBranches, false);
+  assert.equal((await postSettings(app, s, { branch_daily_cap: "  " })).status, 200, "empty cap field does not block the save");
+  assert.equal(getUserById(db, 7)!.branchDailyCap, 0);
 });

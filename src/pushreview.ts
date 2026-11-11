@@ -1,15 +1,18 @@
+import { laneFor } from "./engine.ts";
 import type { Config } from "./config.ts";
 import { startBranchReview, BranchError } from "./branchreview.ts";
 import type { Db } from "./db.ts";
 import type { ReviewQueue } from "./queue.ts";
 import { projectAllowed } from "./projects.ts";
 import type { UserRuntime } from "./review.ts";
-import type { User } from "./users.ts";
+import { engineFields, type User } from "./users.ts";
 
 /** A branch is reviewed only after this long without a new push to it. */
 export const PUSH_DEBOUNCE_MS = 5 * 60_000;
+const MAX_ATTEMPTS = 3;
 const DAY_MS = 86_400_000;
-const EVENT_LOOKBACK_DAYS = 2; // events API filters by date; older pushes are not picked up (e.g. after long downtime)
+const EVENT_LOOKBACK_DAYS = 2; // `after` is an exclusive date: with 2 it returns yesterday and today (1-2 days); older pushes are not picked up (e.g. after long downtime)
+const waitLogged = new Set<string>();
 const capLogged = new Set<string>(); // "owner:YYYY-MM-DD": log the cap once per day
 
 interface Deps { cfg: Config; db: Db; queue: ReviewQueue; runtimeFor: (u: User) => Promise<UserRuntime> }
@@ -33,39 +36,78 @@ export async function pollPushedBranches(d: Deps, u: User, rt: UserRuntime, now 
     const at = Date.parse(e.created_at);
     if (!Number.isFinite(at)) continue;
     d.db.prepare(`INSERT INTO pushed_branches (owner_id, project_id, branch, head_sha, pushed_at) VALUES (?,?,?,?,?)
-      ON CONFLICT(owner_id, project_id, branch) DO UPDATE SET head_sha=excluded.head_sha, pushed_at=excluded.pushed_at WHERE head_sha != excluded.head_sha`)
+      ON CONFLICT(owner_id, project_id, branch) DO UPDATE SET head_sha=excluded.head_sha, pushed_at=excluded.pushed_at, attempts=0 WHERE head_sha != excluded.head_sha`)
       .run(me, e.project_id, p.ref, p.commit_to, at);
   }
   d.db.prepare(`DELETE FROM pushed_branches WHERE owner_id=? AND pushed_at < ?`).run(me, now - EVENT_LOOKBACK_DAYS * DAY_MS * 2);
+  const today = new Date(now).toISOString().slice(0, 10);
+  for (const k of capLogged) if (!k.endsWith(today)) capLogged.delete(k);
 
-  const due = d.db.prepare(`SELECT project_id, branch, head_sha FROM pushed_branches WHERE owner_id=? AND pushed_at <= ? AND (handled_sha IS NULL OR handled_sha != head_sha) ORDER BY pushed_at`)
-    .all(me, now - PUSH_DEBOUNCE_MS) as { project_id: number; branch: string; head_sha: string }[];
-  const handle = (r: { project_id: number; branch: string; head_sha: string }) =>
+  const due = d.db.prepare(`SELECT project_id, branch, head_sha, attempts FROM pushed_branches WHERE owner_id=? AND pushed_at <= ? AND (handled_sha IS NULL OR handled_sha != head_sha) ORDER BY pushed_at`)
+    .all(me, now - PUSH_DEBOUNCE_MS) as { project_id: number; branch: string; head_sha: string; attempts: number }[];
+  if (!due.length) return;
+  // Lane 0 (the shared login) serializes everyone: never queue a push review behind, or in front of, someone's MR review.
+  // Ceiling: under constant MR traffic on a shared lane push reviews wait (they are never dropped, the cap/debounce still apply).
+  if (d.queue.laneBusy(laneFor(engineFields(u), d.cfg.ownerEngineTestUsers))) return;
+  const tag = (r: { project_id: number; branch: string }) => `${u.username} ${r.project_id}@${r.branch}`;
+  // Definitive outcome: the head is not looked at again (logged once). Transient failure: retried next cycle, given up after MAX_ATTEMPTS.
+  const skip = (r: { project_id: number; branch: string; head_sha: string }, why: string) => {
     d.db.prepare(`UPDATE pushed_branches SET handled_sha=? WHERE owner_id=? AND project_id=? AND branch=?`).run(r.head_sha, me, r.project_id, r.branch);
+    console.log(`[push-review] ${tag(r)} skipped: ${why}`);
+  };
+  const retry = (r: { project_id: number; branch: string; head_sha: string; attempts: number }, why: string) => {
+    const n = r.attempts + 1;
+    if (n >= MAX_ATTEMPTS) return skip(r, `${why} (gave up after ${n} attempts)`);
+    d.db.prepare(`UPDATE pushed_branches SET attempts=? WHERE owner_id=? AND project_id=? AND branch=?`).run(n, me, r.project_id, r.branch);
+    console.log(`[push-review] ${tag(r)} will retry: ${why} (attempt ${n})`);
+  };
+  // Config problems (token, engine, skill) are for the user to fix: wait without counting attempts, log once per head+reason.
+  const waiting = (e: unknown) => (e as { status?: number }).status === 401 || (e instanceof BranchError && ["caller_token_invalid", "no_review_engine", "no_skill_uploaded"].includes(e.code));
+  const wait = (r: { project_id: number; branch: string; head_sha: string }, why: string) => {
+    const k = `${me}\n${r.project_id}\n${r.branch}\n${r.head_sha}\n${why}`;
+    if (waitLogged.has(k)) return;
+    if (waitLogged.size > 500) waitLogged.clear();
+    waitLogged.add(k);
+    console.log(`[push-review] ${tag(r)} waiting: ${why}`);
+  };
+  // Returns true when the error is a config problem (e.g. 401): it is the same for every branch, so the caller stops this cycle.
+  const fail = (r: { project_id: number; branch: string; head_sha: string; attempts: number }, e: unknown, what: string): boolean => {
+    if (waiting(e)) { wait(r, `${what}: ${(e as Error).message}`); return true; }
+    retry(r, `${what}: ${(e as Error).message}`);
+    return false;
+  };
+  const gone = (e: unknown) => [403, 404].includes((e as { status?: number }).status ?? 0);
 
   for (const r of due) {
-    // Cheapest checks first; every verdict except "retry later" marks the head handled so it is not re-examined each cycle.
-    if (d.db.prepare(`SELECT 1 FROM branch_reviews WHERE owner_id=? AND project_id=? AND head_sha=?`).get(me, r.project_id, r.head_sha)) { handle(r); continue; } // dedupe: any trigger, any status (failed ones are not auto-retried)
+    // Cheapest checks first.
     const used = (d.db.prepare(`SELECT COUNT(*) n FROM branch_reviews WHERE owner_id=? AND trigger='push' AND created_at > ?`).get(me, now - DAY_MS) as { n: number }).n;
     if (used >= u.branchDailyCap) {
-      const day = `${me}:${new Date(now).toISOString().slice(0, 10)}`;
+      const day = `${me}:${today}`;
       if (!capLogged.has(day)) { capLogged.add(day); console.log(`[push-review] ${u.username}: daily cap ${u.branchDailyCap} reached; pushed branches wait until the 24h window frees`); }
       return; // not handled: picked up when the window frees
     }
-    const project = await rt.gl.getProject(r.project_id).catch(() => undefined);
-    if (!project || !projectAllowed(project.path_with_namespace.toLowerCase(), u.reviewProjects, u.reviewAllProjects)) { handle(r); continue; }
-    if (r.branch === project.default_branch) { handle(r); continue; }
-    if ((await rt.gl.listBranchMrs(r.project_id, r.branch)).length) { handle(r); continue; } // has an MR: the normal MR review owns it
-    const tip = await rt.gl.getBranchSha(r.project_id, r.branch).catch(() => undefined); // deleted branch -> undefined
-    if (tip !== r.head_sha) { handle(r); continue; } // moved or gone: a newer push event supersedes this row
+    let project;
+    try { project = await rt.gl.getProject(r.project_id); } catch (e) { if (gone(e)) skip(r, "project not visible"); else if (fail(r, e, "project lookup")) return; continue; }
+    if (!projectAllowed(project.path_with_namespace.toLowerCase(), u.reviewProjects, u.reviewAllProjects)) { skip(r, "project not in the review list"); continue; }
+    if (r.branch === project.default_branch) { skip(r, "default branch"); continue; }
+    // Dedupe on (owner, project, head, base): a manual review against another base does not stand in for the default-base one. Any trigger, any status (failed ones are not auto-retried).
+    if (d.db.prepare(`SELECT 1 FROM branch_reviews WHERE owner_id=? AND project_id=? AND head_sha=? AND base=?`).get(me, r.project_id, r.head_sha, project.default_branch)) { skip(r, "already has a branch review of this head"); continue; }
+    let mrs;
+    try { mrs = await rt.gl.listBranchMrs(r.project_id, r.branch); } catch (e) { if (fail(r, e, "MR lookup")) return; continue; }
+    if (mrs.length) { skip(r, "branch has an open MR"); continue; } // the normal MR review owns it
+    let tip: string;
+    try { tip = await rt.gl.getBranchSha(r.project_id, r.branch); } catch (e) { if (gone(e)) skip(r, "branch gone"); else if (fail(r, e, "branch lookup")) return; continue; }
+    if (tip !== r.head_sha) { skip(r, "branch moved since the push event"); continue; } // a newer push event supersedes this row
     try {
       await startBranchReview(d, u, { project: String(r.project_id), branch: r.branch }, () => true, "push");
-      handle(r);
-      console.log(`[push-review] ${u.username} ${project.path_with_namespace}@${r.branch} queued`);
+      d.db.prepare(`UPDATE pushed_branches SET handled_sha=? WHERE owner_id=? AND project_id=? AND branch=?`).run(r.head_sha, me, r.project_id, r.branch);
+      console.log(`[push-review] ${tag(r)} queued`);
     } catch (e) {
-      if (e instanceof BranchError && e.code === "too_many_active") return; // busy: retry next cycle
-      console.error(`[push-review] ${u.username} ${project.path_with_namespace}@${r.branch}: ${(e as Error).message}`);
-      handle(r);
+      if (e instanceof BranchError && e.code === "too_many_active") return; // busy: retry next cycle, not counted
+      if (e instanceof BranchError && e.status === 404) skip(r, e.code);
+      else if (waiting(e)) { wait(r, (e as BranchError).code ?? (e as Error).message); return; } // same for every branch: stop this cycle
+      else retry(r, e instanceof BranchError ? e.code : (e as Error).message);
+      continue;
     }
     return; // one per cycle
   }
