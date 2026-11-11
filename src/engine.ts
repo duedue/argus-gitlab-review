@@ -79,8 +79,15 @@ Decide whether the author's reply, checked against the code, shows that the find
 points to where that is handled or documented). Verify every claim of the reply in the repository yourself; a bare assertion
 is not enough. When unsure, answer false.
 
+"reply_holds" is about the AUTHOR'S REPLY, not about the finding:
+- true  = the reply holds: the finding is wrong, does not apply, or is an intentional and documented choice, so it should be closed.
+- false = the reply does not hold: the finding still stands.
+The two fields must agree: if your rationale concludes the finding does not hold (or is already handled/disclosed), "reply_holds" MUST be true;
+if it concludes the finding still stands, "reply_holds" MUST be false.
+Write the rationale first, then decide "reply_holds" from it.
+
 Do NOT post anything. Your final message must be ONLY a JSON object, no prose, no code fences:
-{"valid":true|false,"rationale":"one sentence: what you verified"}
+{"rationale":"one sentence: what you verified and your conclusion","reply_holds":true|false}
 `.trim();
 
 const judgeLanguage = (language: string): string => `Write "rationale" in the language with BCP-47 tag "${language}" (keep identifiers and paths verbatim).`;
@@ -95,10 +102,11 @@ export function buildJudgePrompt(i: JudgeInput): string {
   ].join("\n\n");
 }
 
-const JudgementSchema = z.object({ valid: z.boolean(), rationale: z.string().trim().min(1) });
-export type Judgement = z.infer<typeof JudgementSchema>;
+// The wire key is `reply_holds` (a bare "valid" was read as "the finding is valid" and inverted the verdict).
+const JudgementSchema = z.object({ reply_holds: z.boolean(), rationale: z.string().trim().min(1) });
+export interface Judgement { replyHolds: boolean; rationale: string }
 
-/** `{valid, rationale}` from the engine's final message (plain, fenced or embedded JSON); undefined = could not judge. */
+/** `{replyHolds, rationale}` (wire key `reply_holds`) from the engine's final message (plain, fenced or embedded JSON); undefined = could not judge. */
 export function parseJudgement(text: string): Judgement | undefined {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/)?.[1];
   const a = text.indexOf("{");
@@ -107,7 +115,7 @@ export function parseJudgement(text: string): Judgement | undefined {
     if (!c) continue;
     try {
       const j = JudgementSchema.parse(JSON.parse(c));
-      return { valid: j.valid, rationale: j.rationale.replace(/\s+/g, " ").slice(0, 300) };
+      return { replyHolds: j.reply_holds, rationale: j.rationale.replace(/\s+/g, " ").slice(0, 300) };
     } catch {
       // next candidate
     }
@@ -118,8 +126,8 @@ export function parseJudgement(text: string): Judgement | undefined {
 export const JUDGE_OUTPUT_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["valid", "rationale"],
-  properties: { valid: { type: "boolean" }, rationale: { type: "string" } },
+  required: ["rationale", "reply_holds"],
+  properties: { rationale: { type: "string" }, reply_holds: { type: "boolean" } },
 } as const;
 
 export const OUTPUT_CONTRACT = `

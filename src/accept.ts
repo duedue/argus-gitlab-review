@@ -294,7 +294,7 @@ async function handleCommands(cfg: Config, db: Db, user: User, rt: UserRuntime, 
           const now = await rt.gl.getMr(row.project_id, row.mr_iid);
           mrP = Promise.resolve(now);
           if (now.sha !== row.head_sha) { await say(d.id, M.waitRound); continue; }
-          if (!j.valid) await say(d.id, M.rejected(noMention(j.rationale), user.username));
+          if (!j.replyHolds) await say(d.id, M.rejected(noMention(j.rationale), user.username));
           else if (item!.severity === "minor" || item!.severity === "nit") {
             // Only minor/nit: the AI never accepts major/blocker (or an item whose severity is unknown) on its own.
             recordAccept(db, { ownerId: me, noteId: n.id, dryRun }, { mrId: row.mr_id, sentinel: target, reason: noMention(`${reason} (AI: ${j.rationale})`), by, source: "ai-reply" });

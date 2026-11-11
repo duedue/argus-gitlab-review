@@ -252,9 +252,9 @@ const judgeInput = (cwd: string): JudgeInput => ({
 });
 
 test("CodexEngine.judge: same isolated read-only run, judge contract + one finding on stdin, raw final message back", async () => {
-  const r = codexRig({ out: '{"valid":false,"rationale":"r"}' });
+  const r = codexRig({ out: '{"reply_holds":false,"rationale":"r"}' });
   const text = await r.eng.judge(judgeInput(r.cwd));
-  assert.deepEqual(parseJudgement(text), { valid: false, rationale: "r" });
+  assert.deepEqual(parseJudgement(text), { replyHolds: false, rationale: "r" });
   const args = r.rd("args").split("\n").filter(Boolean).map((l) => l.slice(4));
   assert.equal(args[args.indexOf("--sandbox") + 1], "read-only");
   assert.ok(args.includes("mcp_servers={}"));
@@ -266,13 +266,13 @@ test("CodexEngine.judge: same isolated read-only run, judge contract + one findi
 test("ClaudeCliEngine.judge: read-only claude -p with the judge contract; engineFor's test-user wrapper forwards it", async () => {
   const dir = tmp();
   const bin = join(dir, "fake-claude");
-  writeFileSync(bin, `#!/bin/sh\n{ for a in "$@"; do printf 'ARG:%s\\n' "$a"; done; } > "${dir}/args"\ncat > "${dir}/stdin"\necho '{"type":"result","is_error":false,"result":"{\\"valid\\":true,\\"rationale\\":\\"ok\\"}"}'\n`);
+  writeFileSync(bin, `#!/bin/sh\n{ for a in "$@"; do printf 'ARG:%s\\n' "$a"; done; } > "${dir}/args"\ncat > "${dir}/stdin"\necho '{"type":"result","is_error":false,"result":"{\\"reply_holds\\":true,\\"rationale\\":\\"ok\\"}"}'\n`);
   chmodSync(bin, 0o755);
   const eng = engineFor({ isOwner: false, skillPath, username: "bob", engine: "claude-cli" }, bin, ["bob"])!;
   const warn = console.warn;
   console.warn = () => {};
   try {
-    assert.deepEqual(parseJudgement(await eng.judge!(judgeInput(dir))), { valid: true, rationale: "ok" });
+    assert.deepEqual(parseJudgement(await eng.judge!(judgeInput(dir))), { replyHolds: true, rationale: "ok" });
   } finally {
     console.warn = warn;
   }
@@ -281,4 +281,13 @@ test("ClaudeCliEngine.judge: read-only claude -p with the judge contract; engine
   assert.match(args, /ARG:--strict-mcp-config/);
   assert.ok(args.includes(JUDGE_CONTRACT));
   assert.ok(readFileSync(join(dir, "stdin"), "utf8").includes("FINDING-TITLE"));
+});
+
+test("judge contract names the verdict after the reply, not the finding (0.7.1: a bare \"valid\" was inverted by a model)", () => {
+  assert.ok(JUDGE_CONTRACT.includes('"reply_holds":true|false'));
+  assert.ok(!/"valid"/.test(JUDGE_CONTRACT));
+  assert.match(JUDGE_CONTRACT, /concludes the finding does not hold[^\n]*"reply_holds" MUST be true/);
+  assert.match(JUDGE_CONTRACT, /concludes the finding still stands, "reply_holds" MUST be false/);
+  assert.deepEqual(parseJudgement('{"rationale":"finding 不成立","reply_holds":true}'), { replyHolds: true, rationale: "finding 不成立" });
+  assert.equal(parseJudgement('{"valid":false,"rationale":"finding 不成立"}'), undefined);
 });
