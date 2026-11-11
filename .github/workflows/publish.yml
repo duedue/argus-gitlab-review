@@ -66,7 +66,7 @@ jobs:
         run: |
           set -eu
           git config user.name "Michael Tsai"
-          git config user.email "duedue.tsai@gmail.com"
+          git config user.email "4694172+duedue@users.noreply.github.com"
           git checkout -B publish "origin/$BRANCH"
           git rebase --reset-author-date origin/main
           test "$(node -p "require('./package.json').version")" = "$VERSION" \
