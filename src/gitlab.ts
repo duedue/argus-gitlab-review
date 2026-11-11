@@ -18,6 +18,7 @@ export interface MrSummary {
   state?: string;
   author?: { id: number; username?: string };
   reviewers?: { id: number; username: string }[];
+  assignees?: { id: number; username?: string }[]; // with author: who may `/argus reply`
   updated_at?: string; // with user_notes_count: cheap "anything new?" stamp for the accept watch
   user_notes_count?: number;
 }

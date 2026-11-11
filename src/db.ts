@@ -138,13 +138,14 @@ export function openDb(path: string): Db {
       dry_run INTEGER NOT NULL,                 -- keyed by mode like reviews rows
       sentinel TEXT NOT NULL,                   -- 12-hex finding fingerprint
       reason TEXT NOT NULL,
-      accepted_by INTEGER NOT NULL,             -- GitLab author id of the command note (== owner_id)
+      accepted_by INTEGER NOT NULL,             -- GitLab author id of the command note (owner_id; the MR author/assignee for source 'ai-reply')
       note_id INTEGER NOT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       announced INTEGER NOT NULL DEFAULT 0,     -- 1 once its effect is published (verdict note, or a later review round)
+      source TEXT NOT NULL DEFAULT 'reviewer',  -- reviewer (/argus accept) | ai-reply (minor/nit the AI accepted on the author's /argus reply)
       UNIQUE (owner_id, mr_id, sentinel, dry_run)
     );
-    -- /argus accept notes already answered (accepted or refused): each command is handled once, across restarts.
+    -- /argus accept and /argus reply notes already answered (accepted, judged or refused): each command is handled once, across restarts.
     CREATE TABLE IF NOT EXISTS accept_notes (
       owner_id INTEGER NOT NULL,
       note_id INTEGER NOT NULL,
@@ -199,7 +200,7 @@ function addMissingColumns(db: Db): void {
     branch_reviews: [["attached_review_id", "INTEGER"]], // reviews.id of the MR review this branch review was attached to (NULL = not attached)
     pushed_branches: [["attempts", "INTEGER NOT NULL DEFAULT 0"]], // transient failures on the current head (push trigger)
     auto_approvals: [["revoked_by", "TEXT"]],
-    accepted_findings: [["announced", "INTEGER NOT NULL DEFAULT 0"]],
+    accepted_findings: [["announced", "INTEGER NOT NULL DEFAULT 0"], ["source", "TEXT NOT NULL DEFAULT 'reviewer'"]],
   };
   // One transaction: the new column doubles as the "already migrated" marker, so it must not be committed
   // before the data fix-up below (a crash in between would leave legacy failures stuck forever).
@@ -445,22 +446,30 @@ export function acceptedIds(db: Db, ownerId: number, mrId: number, dryRun: boole
   return new Set(rows.map((r) => r.sentinel));
 }
 
+export type AcceptSource = "reviewer" | "ai-reply";
+
 /** Claim a command note (true = first time) and, for an accept, record it in the same transaction. */
 export function handleNote(db: Db, r: { ownerId: number; noteId: number; dryRun: boolean }, accept?: { mrId: number; sentinel: string; reason: string; by: number }): boolean {
   return db.transaction(() => {
-    const d = r.dryRun ? 1 : 0;
-    if (db.prepare(`INSERT OR IGNORE INTO accept_notes (owner_id, note_id, dry_run) VALUES (?, ?, ?)`).run(r.ownerId, r.noteId, d).changes !== 1) return false;
-    if (accept) {
-      db.prepare(`INSERT OR IGNORE INTO accepted_findings (owner_id, mr_id, dry_run, sentinel, reason, accepted_by, note_id) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-        .run(r.ownerId, accept.mrId, d, accept.sentinel, accept.reason, accept.by, r.noteId);
-    }
+    if (db.prepare(`INSERT OR IGNORE INTO accept_notes (owner_id, note_id, dry_run) VALUES (?, ?, ?)`).run(r.ownerId, r.noteId, r.dryRun ? 1 : 0).changes !== 1) return false;
+    if (accept) recordAccept(db, r, accept);
     return true;
   })();
 }
 
+/** Whether a command note was already answered (no claim). */
+export const noteHandled = (db: Db, ownerId: number, noteId: number, dryRun: boolean): boolean =>
+  db.prepare(`SELECT 1 FROM accept_notes WHERE owner_id=? AND note_id=? AND dry_run=?`).get(ownerId, noteId, dryRun ? 1 : 0) !== undefined;
+
+/** Records an accepted finding (first accept of an id wins). `/argus reply` calls it after the note was claimed and the AI judged. */
+export function recordAccept(db: Db, r: { ownerId: number; noteId: number; dryRun: boolean }, a: { mrId: number; sentinel: string; reason: string; by: number; source?: AcceptSource }): void {
+  db.prepare(`INSERT OR IGNORE INTO accepted_findings (owner_id, mr_id, dry_run, sentinel, reason, accepted_by, note_id, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(r.ownerId, a.mrId, r.dryRun ? 1 : 0, a.sentinel, a.reason, a.by, r.noteId, a.source ?? "reviewer");
+}
+
 /** Accepted findings of this MR with the reviewer's reason (oldest first). */
-export function acceptedFindings(db: Db, ownerId: number, mrId: number, dryRun: boolean): { sentinel: string; reason: string }[] {
-  return db.prepare(`SELECT sentinel, reason FROM accepted_findings WHERE owner_id=? AND mr_id=? AND dry_run=? ORDER BY id`).all(ownerId, mrId, dryRun ? 1 : 0) as { sentinel: string; reason: string }[];
+export function acceptedFindings(db: Db, ownerId: number, mrId: number, dryRun: boolean): { sentinel: string; reason: string; source: AcceptSource }[] {
+  return db.prepare(`SELECT sentinel, reason, source FROM accepted_findings WHERE owner_id=? AND mr_id=? AND dry_run=? ORDER BY id`).all(ownerId, mrId, dryRun ? 1 : 0) as { sentinel: string; reason: string; source: AcceptSource }[];
 }
 
 /** findings_json of every done review of this MR, newest first (to look up what an accepted id was). */

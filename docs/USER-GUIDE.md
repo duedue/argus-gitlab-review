@@ -229,6 +229,16 @@ When you decide a finding needs no change (false positive, deliberate design, ha
 - Each command is processed only once; a malformed command or an unknown id gets an explanatory reply. In Dry-run mode, it only records and posts no comments.
 - The hint at the end of each finding tells the MR author about this flow and links to the [Guide for MR authors](MR-AUTHOR.md).
 
+### MR author rebuttal: `/argus reply`
+
+The MR author or an assignee can dispute one of your findings with `/argus reply <reason>` (inline thread) or `/argus reply #shortid <reason>` (MR comment). On the next polling cycle your Argus judges only that finding, using **your review engine** (same queue lane as your reviews; the cost is charged to your engine). It looks at the finding, the author's reason, and the code at the commit the review ran on.
+
+- Rebuttal holds and the finding is minor or nit: treated as accepted (same record as `/argus accept`, marked as accepted via author reply and AI-judged; the reason column holds the author's reason plus the AI's rationale). The thread is resolved, the verdict recomputed, and the auto-approve rules apply as before (including your auto-approve setting; no approval for self-reviews or when the head has moved).
+- Rebuttal holds but the finding is major or blocker: Argus only replies "suggest accepting" and @-mentions you; accepting is still your call with `/argus accept`.
+- Rebuttal does not hold, or the AI fails or cannot be parsed: Argus replies with an explanation and the item stays open.
+- If the MR has a new commit that the latest review has not covered, nothing is judged; the author is asked to wait for the next round.
+- Only the MR author and assignees (by GitLab account) can use it; if you issue `/argus reply` yourself you are reminded to use `/argus accept`. Each note is handled once. In Dry-run mode it still judges and records, but posts no comments.
+
 ## 6. Auto-approve (optional)
 
 Check "Auto-approve" (「自動 approve」) in Settings. After an actual (non-dry-run) review finishes, if **all** of the following hold, Argus approves **in your name** (and leaves a note stating that Argus did it):

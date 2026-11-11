@@ -59,6 +59,28 @@ Each reviewer sets the limit on their own settings page. When an MR exceeds it, 
    - Finding in the summary: comment on the MR with `/argus accept #24a3c7 <reason>`
 3. On the next polling cycle (about 30 seconds; if Argus is reviewing other MRs, it waits for the queue to free up), Argus replies "accepted" (「已接受」), resolves the thread, and posts a short note updating the verdict (e.g. "1 accepted, 0 remaining, verdict updated to: mergeable" (「已接受 1 項，剩 0 項，結論更新為：可合併」)). It does not re-run the AI review. Later rounds no longer list the item, and the AI reporting it again is filtered out.
 
-Only the reviewer of that review can mark a finding accepted. If anyone else (including the MR author) issues the command, Argus replies with an explanation and @-mentions the reviewer. A malformed command or an unknown id also gets an explanatory reply.
+Only the reviewer of that review can mark a finding accepted. If anyone else (including the MR author) issues `/argus accept`, Argus replies with an explanation and @-mentions the reviewer. A malformed command or an unknown id also gets an explanatory reply.
+
+### If you think a finding is a false positive: `/argus reply`
+
+The MR author or an assignee of the MR can dispute a finding with `/argus reply`; the reviewer's Argus has its AI judge it, so you do not have to wait for the reviewer:
+
+- Inline finding: reply in that thread with `/argus reply <reason>`
+- Finding in the summary: comment on the MR with `/argus reply #24a3c7 <reason>`
+
+The reason is required. Give something checkable (for example "`docs/archive/` already exists at HEAD" or "the caller checks this at `x.ts:42`"). A plain reply does not trigger a judgement; you must use this command.
+
+Argus looks only at that one finding, your reason, and the code at the commit the review ran on (it can inspect the paths you mention). It does not re-review the MR. Outcomes:
+
+| AI judgement | Finding severity | What Argus does |
+|---|---|---|
+| Reply holds | minor, nit | Marks it "accepted" (recorded as accepted via author reply, AI-judged), resolves the thread, updates the verdict; auto-approves as usual when the conditions are met |
+| Reply holds | major, blocker | Only replies "suggest accepting" and @-mentions the reviewer; the thread stays open and the reviewer decides with `/argus accept` |
+| Reply does not hold | any | Replies with the rationale; the thread stays open |
+| Could not judge (AI failure or unparsable output) | any | Asks the reviewer to decide; the thread stays open |
+
+- If you pushed a new commit and its review round has not finished yet, Argus does not judge; it asks you to reply again after that round completes.
+- Each `/argus reply` note is handled once; to add more reasoning, post a new one.
+- Permission is checked against GitLab accounts (the MR author and assignees), not against anything written in the note. The reviewer should use `/argus accept` directly.
 
 If the project requires all threads to be resolved before merging and the reviewer has not dealt with it yet, you can resolve the thread manually after explaining why.
