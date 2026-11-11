@@ -24,7 +24,7 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           token: ${{ secrets.PUBLISH_PAT }}
@@ -84,7 +84,7 @@ jobs:
           git add CHANGELOG.md
           git commit -m "docs(changelog): $VERSION"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         if: steps.pick.outputs.skip == 'false'
         with:
           node-version-file: .nvmrc
@@ -126,7 +126,7 @@ jobs:
           VERSION: ${{ steps.pick.outputs.version }}
         run: gh release create "v$VERSION" --title "Argus $VERSION" --notes-file ".changes/$VERSION.md"
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         if: steps.pick.outputs.skip == 'false'
         with:
           registry: ghcr.io
