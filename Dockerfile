@@ -1,4 +1,15 @@
 # Argus image. Build: docker compose build
+
+# deps stage: better-sqlite3 13 ships no prebuilt binaries and always compiles via node-gyp,
+# which needs python3/make/g++. Build node_modules here so the runtime image stays toolchain-free.
+FROM node:22-bookworm-slim AS deps
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 make g++ \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci && npm cache clean --force
+
 FROM node:22-bookworm-slim
 
 # git: shallow clones of the MRs under review; ripgrep: fast search for the review agents; ca-certificates: HTTPS to GitLab/Jira/model APIs.
@@ -25,7 +36,7 @@ USER node
 
 # tsx (a devDependency) runs the TypeScript sources at runtime (`npm run web`), so install everything.
 COPY --chown=node:node package.json package-lock.json ./
-RUN npm ci && npm cache clean --force
+COPY --chown=node:node --from=deps /app/node_modules ./node_modules
 COPY --chown=node:node tsconfig.json ./
 COPY --chown=node:node src ./src
 # In-app guides (/docs/setup, /docs/guide, /docs/mr) are rendered from these at startup.
