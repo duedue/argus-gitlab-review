@@ -31,6 +31,7 @@ export interface User {
   claudeTokenInvalid: boolean; // the CLI rejected it (401); the user must paste a new one
   maxDiffLines: number | null; // diff size above which this reviewer's reviews are skipped; null = cfg.maxDiffLines
   reviewProjects: string[]; // normalized allowlist for automatic reviews (strict: [] = none)
+  branchDailyCap: number; // push-triggered branch reviews per day (default 20)
   reviewAllProjects: boolean; // opt-in: auto-review every assigned MR, ignoring reviewProjects
 }
 
@@ -76,6 +77,7 @@ const toUser = (r: Record<string, unknown>): User => ({
   claudeTokenInvalid: r.claude_token_invalid === 1,
   maxDiffLines: (r.max_diff_lines as number | null) ?? null,
   reviewProjects: ((r.review_projects as string | null) ?? "").split("\n").filter(Boolean),
+  branchDailyCap: (r.branch_daily_cap as number | undefined) ?? 20,
   reviewAllProjects: r.review_all_projects === 1,
 });
 
@@ -204,6 +206,11 @@ const SETTABLE = {
   review_all_projects: (v: string) => {
     if (v !== "0" && v !== "1") throw new Error("review_all_projects must be 0 or 1");
     return Number(v);
+  },
+  branch_daily_cap: (v: string) => {
+    const n = Number(v);
+    if (!/^\d+$/.test(v) || n > 1000) throw new Error("branch_daily_cap must be an integer 0 to 1000 (0 = off)");
+    return n;
   },
   auto_approve: (v: string) => {
     if (v !== "0" && v !== "1") throw new Error("auto_approve must be 0 or 1");

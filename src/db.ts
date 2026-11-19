@@ -27,6 +27,27 @@ export function openDb(path: string): Db {
       mr_url TEXT,                          -- GitLab web_url, for the history page (null on pre-M3 rows)
       UNIQUE (owner_id, mr_id, head_sha, dry_run)
     );
+    -- Pre-MR branch reviews (src/branchreview.ts). Deliberately NOT the reviews table: that one is the per-MR claim/dedupe.
+    CREATE TABLE IF NOT EXISTS branch_reviews (
+      id TEXT PRIMARY KEY,                  -- job uuid (the API id)
+      owner_id INTEGER NOT NULL,
+      project_id INTEGER NOT NULL,
+      project_path TEXT NOT NULL,
+      branch TEXT NOT NULL,
+      base TEXT NOT NULL,
+      merge_base TEXT NOT NULL,
+      head_sha TEXT NOT NULL,
+      status TEXT NOT NULL,                 -- queued | running | done | failed
+      verdict TEXT,
+      findings_json TEXT,                   -- {findings, belowThreshold, lines, files, model, skipped}
+      summary TEXT,
+      error TEXT,
+      trigger TEXT NOT NULL,                -- api | cli | push
+      created_at INTEGER NOT NULL,          -- epoch ms
+      finished_at INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_branch_reviews_owner ON branch_reviews (owner_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_branch_reviews_head ON branch_reviews (owner_id, project_id, head_sha);
     CREATE TABLE IF NOT EXISTS users (
       gitlab_user_id INTEGER PRIMARY KEY,
       username TEXT NOT NULL UNIQUE,
@@ -142,6 +163,7 @@ function addMissingColumns(db: Db): void {
       ["token_invalid", "INTEGER NOT NULL DEFAULT 0"],
       ["approved", "INTEGER NOT NULL DEFAULT 1"],
       ["auto_approve", "INTEGER NOT NULL DEFAULT 0"], // opt-in: Argus approves clean MRs under the user's name
+      ["branch_daily_cap", "INTEGER NOT NULL DEFAULT 20"], // max push-triggered branch reviews per day (push trigger not built yet; the settings field comes with it)
       ["review_assigned", "INTEGER NOT NULL DEFAULT 0"], // opt-in: also poll MRs where the user is the assignee (not only reviewer)
       ["engine", "TEXT NOT NULL DEFAULT 'claude-cli'"], // which review engine runs for this user; chosen explicitly by the owner, never inferred
       ["model", "TEXT"], // claude --model alias chosen by the user; NULL = CLI default
@@ -493,9 +515,56 @@ export const humanRevokedAutoApproval = (db: Db, ownerId: number, mrId: number):
  */
 export function releaseStaleRunning(db: Db): number {
   return db.transaction(() => {
+    // Branch reviews are not retried: the in-memory queue is gone, so mark them failed instead of leaving them active forever.
+    db.prepare(`UPDATE branch_reviews SET status='failed', error='interrupted', finished_at=? WHERE status IN ('queued','running')`).run(Date.now());
     const rows = db.prepare(`SELECT owner_id, project_id, mr_iid, head_sha FROM reviews WHERE status='running'`).all() as { owner_id: number; project_id: number; mr_iid: number; head_sha: string }[];
     db.prepare(`DELETE FROM reviews WHERE status='running'`).run();
     for (const r of rows) console.warn(`[startup] released interrupted review: owner ${r.owner_id} project ${r.project_id}!${r.mr_iid}@${r.head_sha.slice(0, 8)}; will be retried`);
     return rows.length;
   })();
 }
+
+// --- branch reviews (separate from `reviews`; see branchreview.ts) ---
+
+export type BranchReviewTrigger = "api" | "cli" | "push";
+export interface BranchReviewRow {
+  id: string; owner_id: number; project_id: number; project_path: string; branch: string; base: string; merge_base: string; head_sha: string;
+  status: "queued" | "running" | "done" | "failed"; verdict: string | null; findings_json: string | null; summary: string | null; error: string | null;
+  trigger: BranchReviewTrigger; created_at: number; finished_at: number | null;
+}
+
+export function insertBranchReview(db: Db, r: Pick<BranchReviewRow, "id" | "owner_id" | "project_id" | "project_path" | "branch" | "base" | "merge_base" | "head_sha" | "trigger"> & { status?: "queued" | "running" }): void {
+  db.prepare(`INSERT INTO branch_reviews (id, owner_id, project_id, project_path, branch, base, merge_base, head_sha, status, trigger, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(r.id, r.owner_id, r.project_id, r.project_path, r.branch, r.base, r.merge_base, r.head_sha, r.status ?? "queued", r.trigger, Date.now());
+}
+
+export const setBranchReviewRunning = (db: Db, id: string): void => void db.prepare(`UPDATE branch_reviews SET status='running' WHERE id=?`).run(id);
+
+export function finishBranchReview(db: Db, id: string, r: { error: string } | { verdict?: string; summary?: string; findingsJson: string }): void {
+  if ("error" in r) db.prepare(`UPDATE branch_reviews SET status='failed', error=?, finished_at=? WHERE id=?`).run(r.error, Date.now(), id);
+  else db.prepare(`UPDATE branch_reviews SET status='done', verdict=?, summary=?, findings_json=?, finished_at=? WHERE id=?`).run(r.verdict ?? null, r.summary ?? null, r.findingsJson, Date.now(), id);
+}
+
+/** Owner-scoped: another user's id looks like a missing one. */
+export const getBranchReview = (db: Db, ownerId: number, id: string): BranchReviewRow | undefined =>
+  db.prepare(`SELECT * FROM branch_reviews WHERE id=? AND owner_id=?`).get(id, ownerId) as BranchReviewRow | undefined;
+
+export const activeBranchReview = (db: Db, ownerId: number): BranchReviewRow | undefined =>
+  db.prepare(`SELECT * FROM branch_reviews WHERE owner_id=? AND status IN ('queued','running') ORDER BY created_at LIMIT 1`).get(ownerId) as BranchReviewRow | undefined;
+
+/** The owner's branch reviews, newest first. Keyset pagination: pass the last row's `created_at`+`id` as `before` for the next page. */
+export function listBranchReviews(db: Db, ownerId: number, opts: { limit?: number; before?: { createdAt: number; id: string } } = {}): BranchReviewRow[] {
+  const limit = Math.min(Math.max(opts.limit ?? 20, 1), 100);
+  const b = opts.before;
+  return db.prepare(`SELECT * FROM branch_reviews WHERE owner_id=? ${b ? "AND (created_at < ? OR (created_at = ? AND id < ?))" : ""} ORDER BY created_at DESC, id DESC LIMIT ?`)
+    .all(...(b ? [ownerId, b.createdAt, b.createdAt, b.id, limit] : [ownerId, limit])) as BranchReviewRow[];
+}
+
+export const BRANCH_REVIEW_RETENTION_MS = 90 * 24 * 3_600_000;
+/** Deletes finished branch reviews older than the retention window (queued/running rows are never touched). Returns the count. */
+export const pruneBranchReviews = (db: Db, now = Date.now()): number =>
+  db.prepare(`DELETE FROM branch_reviews WHERE status IN ('done','failed') AND COALESCE(finished_at, created_at) < ?`).run(now - BRANCH_REVIEW_RETENTION_MS).changes;
+
+/** Latest finished (done) branch review of exactly this commit. */
+export const findDoneBranchReview = (db: Db, ownerId: number, projectId: number, headSha: string): BranchReviewRow | undefined =>
+  db.prepare(`SELECT * FROM branch_reviews WHERE owner_id=? AND project_id=? AND head_sha=? AND status='done' ORDER BY created_at DESC, id DESC LIMIT 1`).get(ownerId, projectId, headSha) as BranchReviewRow | undefined;

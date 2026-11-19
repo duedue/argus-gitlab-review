@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Config } from "./config.ts";
 import { laneFor, reviewTimeoutMs } from "./engine.ts";
+import { activeBranchReview, finishBranchReview, getBranchReview, insertBranchReview, setBranchReviewRunning, type BranchReviewRow, type BranchReviewTrigger, type Db } from "./db.ts";
 import { deriveVerdict, passesThreshold, type Finding, type Verdict } from "./findings.ts";
 import { fetchRequirements } from "./jira.ts";
 import { readProjectContext } from "./context.ts";
@@ -47,7 +48,7 @@ export function validBranchName(s: unknown): s is string {
 }
 export const validProjectRef = (s: unknown): s is string => typeof s === "string" && s.length <= 255 && PROJECT_RE.test(s);
 
-interface Resolved { projectId: number; repoUrl: string; head: string; base: string; mergeBase: string }
+interface Resolved { projectId: number; projectPath: string; repoUrl: string; head: string; base: string; mergeBase: string }
 
 /** Cheap GitLab lookups with the caller's token (also proves they can see the project). Throws BranchError. */
 export async function resolveBranch(rt: UserRuntime, t: BranchTarget): Promise<Resolved> {
@@ -66,7 +67,7 @@ export async function resolveBranch(rt: UserRuntime, t: BranchTarget): Promise<R
   const baseSha = await rt.gl.getBranchSha(project.id, base).catch((e) => fail(e, "base_not_found"));
   // Never `base..head` from the target tip: target commits merged into the branch would inflate the diff.
   const mergeBase = await rt.gl.getMergeBase(project.id, baseSha, head).catch((e) => fail(e, "merge_base_not_found"));
-  return { projectId: project.id, repoUrl: project.http_url_to_repo, head, base, mergeBase };
+  return { projectId: project.id, projectPath: project.path_with_namespace, repoUrl: project.http_url_to_repo, head, base, mergeBase };
 }
 
 /** Runs the review of an already-resolved target. Writes nothing to GitLab or the database. */
@@ -101,14 +102,14 @@ export function branchResultJson(r: BranchResult) {
   return { ...rest, merge_base: mergeBase, below_threshold: belowThreshold };
 }
 
-// --- async API jobs (in memory: a result is only useful for the minutes after the run; lost on restart) ---
+// --- async API jobs (rows of branch_reviews; survive restarts; never touch the MR `reviews` table) ---
 
 export interface BranchJob {
   id: string;
   userId: number;
   status: "queued" | "running" | "done" | "failed";
   finishedAt?: number;
-  project: string;
+  project: string; // numeric project id
   branch: string;
   base: string;
   head: string;
@@ -118,30 +119,39 @@ export interface BranchJob {
   error?: string;
 }
 
-const JOB_TTL_MS = 3_600_000;
-const MAX_JOBS = 200;
-const jobs = new Map<string, BranchJob>(); // insertion order = age
-const active = (j: BranchJob) => j.status === "queued" || j.status === "running";
+/** Persists a finished run (shared by the API job and the CLI). */
+export function saveBranchResult(db: Db, id: string, r: BranchResult): void {
+  const { verdict, summary, head: _h, base: _b, mergeBase: _m, ...rest } = r;
+  finishBranchReview(db, id, { verdict, summary, findingsJson: JSON.stringify(rest) });
+}
 
-/** Drops finished jobs older than the TTL, then the oldest finished ones above the cap. Queued/running jobs are never dropped. */
-export function sweepBranchJobs(now = Date.now(), ttlMs = JOB_TTL_MS, max = MAX_JOBS): void {
-  for (const [id, j] of jobs) if (!active(j) && now - (j.finishedAt ?? j.createdAt) > ttlMs) jobs.delete(id);
-  for (const [id, j] of jobs) {
-    if (jobs.size <= max) break;
-    if (!active(j)) jobs.delete(id);
-  }
+/** Records a run that is executing right now outside the queue (CLI). Returns the row id. */
+export function startBranchRun(db: Db, ownerId: number, r: Resolved, t: BranchTarget, trigger: BranchReviewTrigger): string {
+  const id = randomUUID();
+  insertBranchReview(db, { id, owner_id: ownerId, project_id: r.projectId, project_path: r.projectPath, branch: t.branch, base: r.base, merge_base: r.mergeBase, head_sha: r.head, trigger, status: "running" });
+  return id;
+}
+
+function jobFromRow(r: BranchReviewRow): BranchJob {
+  const stored = r.findings_json ? (JSON.parse(r.findings_json) as Omit<BranchResult, "head" | "base" | "mergeBase" | "verdict" | "summary">) : undefined;
+  return {
+    id: r.id, userId: r.owner_id, status: r.status, finishedAt: r.finished_at ?? undefined, project: String(r.project_id), branch: r.branch, base: r.base,
+    head: r.head_sha, mergeBase: r.merge_base, createdAt: r.created_at, error: r.error ?? undefined,
+    result: stored && { ...stored, head: r.head_sha, base: r.base, mergeBase: r.merge_base, verdict: (r.verdict as Verdict | null) ?? undefined, summary: r.summary ?? undefined },
+  };
 }
 
 /** Queue dedupe key of one (user, project, head, merge-base) review. */
 export const branchQueueKey = (userId: number, projectId: number, head: string, mergeBase: string): string => `branch:${queueKey(userId, projectId, head)}:${mergeBase}`;
 
-export function getBranchJob(id: string, userId: number): BranchJob | undefined {
-  const j = jobs.get(id);
-  return j && j.userId === userId ? j : undefined; // another user's id looks like a missing one
+export function getBranchJob(db: Db, id: string, userId: number): BranchJob | undefined {
+  const r = getBranchReview(db, userId, id); // another user's id looks like a missing one
+  return r && jobFromRow(r);
 }
 
 export interface BranchDeps {
   cfg: Config;
+  db: Db;
   queue: ReviewQueue;
   runtimeFor: (u: User) => Promise<UserRuntime>;
 }
@@ -157,33 +167,28 @@ export async function startBranchReview(d: BranchDeps, caller: User, t: BranchTa
   }
   if (!rt.engine) throw new BranchError(400, "no_review_engine");
   const r = await resolveBranch(rt, t);
-  sweepBranchJobs();
   // One active job per user: a queued job occupies the user's lane (the shared-login lane serializes everyone's MR reviews).
   // The same commit pair already in flight is handed back instead of rejected.
-  for (const j of jobs.values()) {
-    if (j.userId !== caller.gitlabUserId || !active(j)) continue;
-    if (j.project === String(r.projectId) && j.head === r.head && j.mergeBase === r.mergeBase) return j;
-    throw new BranchError(429, "too_many_active", { active_id: j.id });
+  const act = activeBranchReview(d.db, caller.gitlabUserId);
+  if (act) {
+    if (act.project_id === r.projectId && act.head_sha === r.head && act.merge_base === r.mergeBase) return jobFromRow(act);
+    throw new BranchError(429, "too_many_active", { active_id: act.id });
   }
   // An identical run still winding down in the queue would never start this job: reject before charging.
   const qkey = branchQueueKey(caller.gitlabUserId, r.projectId, r.head, r.mergeBase);
   if (d.queue.has(qkey)) throw new BranchError(429, "too_many_active");
   if (!charge()) throw new BranchError(429, "rate_limited"); // charged only when a job is really created
-  const now = Date.now();
-  const job: BranchJob = { id: randomUUID(), userId: caller.gitlabUserId, status: "queued", project: String(r.projectId), branch: t.branch, base: r.base, head: r.head, mergeBase: r.mergeBase, createdAt: now };
-  jobs.set(job.id, job);
+  const id = randomUUID();
+  insertBranchReview(d.db, { id, owner_id: caller.gitlabUserId, project_id: r.projectId, project_path: r.projectPath, branch: t.branch, base: r.base, merge_base: r.mergeBase, head_sha: r.head, trigger: "api" });
   d.queue.enqueue(laneFor(engineFields(caller), d.cfg.ownerEngineTestUsers), qkey, async () => {
-    job.status = "running";
+    setBranchReviewRunning(d.db, id);
     try {
-      job.result = await runBranchReview(d.cfg, caller, rt, t, r);
-      job.status = "done";
+      saveBranchResult(d.db, id, await runBranchReview(d.cfg, caller, rt, t, r));
     } catch (e) {
       console.error(`[branch-review] ${caller.username} ${t.project}@${t.branch} FAILED: ${(e as Error).message}`);
-      job.status = "failed";
-      job.error = "review_failed"; // detail (may hold server paths) stays in the log
+      finishBranchReview(d.db, id, { error: "review_failed" }); // detail (may hold server paths) stays in the log
     }
-    job.finishedAt = Date.now();
   });
-  console.log(`[branch-review] ${caller.username} ${t.project}@${t.branch} queued (${job.id})`);
-  return job;
+  console.log(`[branch-review] ${caller.username} ${t.project}@${t.branch} queued (${id})`);
+  return jobFromRow(getBranchReview(d.db, caller.gitlabUserId, id)!);
 }

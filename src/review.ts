@@ -1,7 +1,7 @@
 import type { Config } from "./config.ts";
-import { acceptedIds, markAnnounced, carriedSummaryItems, claimReview, replaceSeenMrs, recordSkip, clearRetry, dueRetries, isSelfReview, failReview, releaseClaim, finishReview, lastReviewedBaseSha, lastReviewedSha, nextRound, recordBaseSha, type Db } from "./db.ts";
+import { acceptedIds, markAnnounced, carriedSummaryItems, claimReview, replaceSeenMrs, recordSkip, clearRetry, dueRetries, isSelfReview, failReview, releaseClaim, finishReview, findDoneBranchReview, pruneBranchReviews, lastReviewedBaseSha, lastReviewedSha, nextRound, recordBaseSha, type Db } from "./db.ts";
 import { fetchRequirements } from "./jira.ts";
-import { deriveVerdict } from "./findings.ts";
+import { deriveVerdict, type Finding, type Verdict } from "./findings.ts";
 import { chooseEngine, laneFor, reviewTimeoutMs, SHARED_LOGIN_LANE, SKIP_REASONS, type ReviewEngine } from "./engine.ts";
 import { GitLab, isDraft, type MrSummary } from "./gitlab.ts";
 import { syncApproval } from "./approve.ts";
@@ -75,6 +75,8 @@ async function cleanupClones(cfg: Config, u: User, queue: ReviewQueue): Promise<
 async function pruneOrphans(cfg: Config, db: Db, queue: ReviewQueue): Promise<void> {
   try {
     if (!cleanupDue("orphans")) return;
+    const n = pruneBranchReviews(db);
+    if (n) console.log(`[cleanup] removed ${n} branch review(s) past retention`);
     const known = new Set(listUsers(db).map((u) => u.gitlabUserId)); // the full DB list, never the per-cycle filtered one (setup mode drops OAuth users)
     for (const id of cloneUserIds(cfg.dataDir)) {
       if (known.has(id)) continue;
@@ -229,6 +231,21 @@ export async function reviewMr(cfg: Config, db: Db, user: User, rt: UserRuntime,
       return;
     }
     if (headOverride) Object.assign(mr, { sha: headOverride, diff_refs: { ...mr.diff_refs, head_sha: headOverride } });
+    // The author's own done branch review of this exact head against this MR's target branch is posted as the review
+    // (summary only, never auto-approves) instead of running the engine again; a later head reviews normally.
+    const pre = persist && mr.author?.id === me ? findDoneBranchReview(db, me, s.project_id, mr.sha) : undefined;
+    const stored = pre && pre.base === mr.target_branch && pre.findings_json ? (JSON.parse(pre.findings_json) as { findings: Finding[]; belowThreshold: Finding[]; skipped?: string }) : undefined;
+    if (pre && stored && !stored.skipped) {
+      const all = [...stored.findings, ...stored.belowThreshold];
+      const verdict = (pre.verdict as Verdict | null) ?? deriveVerdict(all);
+      const pub = { dryRun, minSeverity: user.severityThreshold, minConfidence: user.confidenceThreshold, summaryOnly: true, hint: { reviewer: user.username, baseUrl: cfg.web.baseUrl, language: user.language } };
+      const ctx = { round: 1, sha: mr.sha, language: user.language, verdict, summary: pre.summary ?? undefined, checked: [], preMr: { head: pre.head_sha, mergeBase: pre.merge_base, base: pre.base, at: pre.finished_at ?? pre.created_at } };
+      const summaryOnly = await publish(rt.gl, mr, all, pub, undefined, ctx);
+      const summaryOpen = summaryOnly.map((f) => ({ id: fp(f), file: f.file, line: f.line, title: f.title }));
+      finish(db, me, s.id, s.sha, dryRun, "done", { findings: { findings: all, verdict, summaryOpen, unfixedPrev: [] } });
+      console.log(`[review] ${tag} attached pre-MR branch review ${pre.id} (${verdict}), ${all.length} finding(s); no engine run, no auto-approve`);
+      return;
+    }
     const project = await rt.gl.getProject(s.project_id);
     if (persist) recordBaseSha(db, me, s.id, s.sha, dryRun, mr.diff_refs.base_sha);
     const prepOpts = {

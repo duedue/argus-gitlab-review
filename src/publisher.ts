@@ -12,6 +12,7 @@ export interface PublishOpts {
   minSeverity: Severity;
   minConfidence: number;
   hint?: AcceptHint;
+  summaryOnly?: boolean; // no inline threads: every fresh finding goes into the summary note (attached pre-MR review)
 }
 
 /** Who may `/argus accept` a finding, shown under every finding so the MR author knows the rule where they read it. */
@@ -66,6 +67,7 @@ export interface SummaryCtx {
   track?: Track; // re-reviews only
   accepted?: number; // findings the reviewer accepted on this MR (human verdict, excluded from the verdict)
   model?: string; // model the CLI reported using; shown as a small footer
+  preMr?: { head: string; mergeBase: string; base: string; at: number }; // this summary is a stored branch review, not a run on this MR
 }
 
 const LABELS = {
@@ -78,6 +80,7 @@ const LABELS = {
     none: "未發現需要回報的問題。",
     model: "使用模型",
     accepted: (n: number) => `審查者已接受 ${n} 項（人工裁決，不列入本輪發現與結論）`,
+    preMr: (x: { head: string; mergeBase: string; base: string; at: number }) => `> **開 MR 前的 branch review 結果**（未在此 MR 重跑）：branch head \`${x.head.slice(0, 8)}\`、merge-base \`${x.mergeBase.slice(0, 8)}\`（對 \`${x.base}\`）、審查時間 ${new Date(x.at).toISOString()}`,
   },
   en: {
     round: (n: number) => `Round ${n}`,
@@ -88,6 +91,7 @@ const LABELS = {
     none: "No issues found.",
     model: "model",
     accepted: (n: number) => `${n} item(s) accepted by the reviewer (human decision; excluded from findings and verdict)`,
+    preMr: (x: { head: string; mergeBase: string; base: string; at: number }) => `> **Pre-MR branch review result** (not re-run on this MR): branch head \`${x.head.slice(0, 8)}\`, merge-base \`${x.mergeBase.slice(0, 8)}\` (against \`${x.base}\`), reviewed at ${new Date(x.at).toISOString()}`,
   },
 };
 const loc = (language: string) => (language.startsWith("zh") ? LABELS.zh : LABELS.en);
@@ -101,6 +105,7 @@ export function summaryBody(inline: Finding[], items: Finding[], ctx: SummaryCtx
   if (!ctx) return [`${MARKER} review summary`, ...(extra ? [extra] : [])].join("\n\n");
   const L = loc(ctx.language);
   const parts = [`${MARKER} · ${L.round(ctx.round)} (\`${ctx.sha.slice(0, 8)}\`) · **${L.verdict[ctx.verdict]}**`];
+  if (ctx.preMr) parts.push(L.preMr(ctx.preMr));
   if (ctx.summary) parts.push(ctx.summary);
   if (extra) parts.push(extra);
   const rows: string[] = [];
@@ -140,7 +145,8 @@ export async function publish(gl: GitLab, mr: Mr, findings: Finding[], o: Publis
   }
   // Items still open from earlier rounds are already reported (also in dry-run, where GitLab holds no markers).
   const prevIds = new Set((ctx?.track?.prev ?? []).map((t) => t.id));
-  const p = plan(findings, o, new Set([...seen, ...prevIds]));
+  const p0 = plan(findings, o, new Set([...seen, ...prevIds]));
+  const p = o.summaryOnly ? { ...p0, inline: [], summaryItems: p0.fresh } : p0;
   const posted: Finding[] = [];
   const summaryItems = [...p.summaryItems];
   const send = async (label: string, body: string, fn: () => Promise<void>) => {

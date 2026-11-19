@@ -1,11 +1,11 @@
 import { join } from "node:path";
 import { assertRequiredConfig, loadConfig } from "./config.ts";
 import { getMasterKey, keyInit } from "./crypto.ts";
-import { releaseStaleRunning, openDb } from "./db.ts";
+import { finishBranchReview, releaseStaleRunning, openDb } from "./db.ts";
 import { warnOwnerEngineTest } from "./engine.ts";
 import { GitLab } from "./gitlab.ts";
 import type { OAuthCtx } from "./oauth.ts";
-import { branchResultJson, resolveBranch, runBranchReview, validBranchName, validProjectRef, type BranchResult } from "./branchreview.ts";
+import { branchResultJson, resolveBranch, runBranchReview, saveBranchResult, startBranchRun, validBranchName, validProjectRef, type BranchResult } from "./branchreview.ts";
 import { parseHeadSha, reviewMr } from "./review.ts";
 import { pollCycle, pollLoop, runtimeFactory } from "./runtime.ts";
 import { applyStoredSettings, resetSetup, resolveOAuthCreds } from "./setup.ts";
@@ -131,7 +131,15 @@ if (cmd === "key" && sub === "init") {
     const target = { project: sub!, branch: branch!, base };
     let res: BranchResult;
     try {
-      res = await runBranchReview(cfg, runUser, r, target, await resolveBranch(r, target));
+      const resolved = await resolveBranch(r, target);
+      const runId = startBranchRun(db, runUser.gitlabUserId, resolved, target, "cli");
+      try {
+        res = await runBranchReview(cfg, runUser, r, target, resolved);
+        saveBranchResult(db, runId, res);
+      } catch (e) {
+        finishBranchReview(db, runId, { error: "review_failed" });
+        throw e;
+      }
     } catch (e) {
       die((e as Error).message);
     }
