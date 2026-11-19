@@ -5,6 +5,7 @@ import { releaseStaleRunning, openDb } from "./db.ts";
 import { warnOwnerEngineTest } from "./engine.ts";
 import { GitLab } from "./gitlab.ts";
 import type { OAuthCtx } from "./oauth.ts";
+import { branchResultJson, resolveBranch, runBranchReview, validBranchName, validProjectRef, type BranchResult } from "./branchreview.ts";
 import { parseHeadSha, reviewMr } from "./review.ts";
 import { pollCycle, pollLoop, runtimeFactory } from "./runtime.ts";
 import { applyStoredSettings, resetSetup, resolveOAuthCreds } from "./setup.ts";
@@ -17,11 +18,24 @@ const USAGE = `usage: cli.ts <command>
   setup reset                           (forget the web-setup OAuth/Jira/owner settings; next start re-enters setup mode)
   once | loop
   review <project_id> <mr_iid> [--user <username>] [--head <sha>] [--engine <name>]
-                                        (always dry-run; --head reviews the MR as of that commit; --engine overrides the user's engine for this run only)`;
+                                        (always dry-run; --head reviews the MR as of that commit; --engine overrides the user's engine for this run only)
+  review-branch <project_path_or_id> <branch> [--base <branch>] [--user <username>] [--engine <name>] [--json]
+                                        (pre-MR review against the merge-base with --base, default the project's default branch;
+                                         prints findings only: nothing is posted to GitLab, nothing is recorded)`;
 const die = (msg: string): never => {
   console.error(msg);
   process.exit(2);
 };
+
+function formatBranchResult(r: BranchResult): string {
+  const line = (f: BranchResult["findings"][number]) => `  [${f.severity}] ${f.file}${f.line ? `:${f.line}` : ""}  ${f.title} (confidence ${f.confidence})\n      ${f.body.replace(/\n/g, "\n      ")}`;
+  return [
+    `head ${r.head.slice(0, 10)}  base ${r.base}  merge-base ${r.mergeBase.slice(0, 10)}  ${r.lines} changed lines in ${r.files.length} file(s)`,
+    ...(r.skipped ? [`skipped: ${r.skipped}`] : [`verdict: ${r.verdict}${r.model ? `  (${r.model})` : ""}`, ...(r.summary ? [r.summary] : [])]),
+    ...(r.findings.length ? ["", `findings (${r.findings.length}):`, ...r.findings.map(line)] : []),
+    ...(r.belowThreshold.length ? ["", `below your threshold (${r.belowThreshold.length}):`, ...r.belowThreshold.map(line)] : []),
+  ].join("\n");
+}
 
 const [cmd, sub, ...rest] = process.argv.slice(2);
 const cfg = loadConfig();
@@ -90,7 +104,7 @@ if (cmd === "key" && sub === "init") {
 } else if (cmd === "user" && sub === "remove") {
   const name = rest[0] ?? die(USAGE);
   console.log(removeUser(db, name) ? `removed ${name}` : `no such user: ${name}`);
-} else if (cmd === "once" || cmd === "loop" || cmd === "review") {
+} else if (cmd === "once" || cmd === "loop" || cmd === "review" || cmd === "review-branch") {
   warnOwnerEngineTest(cfg.ownerEngineTestUsers);
   // Only the long-running poller owns stale-row cleanup; `once`/`review` may run beside a live server.
   if (cmd === "loop") releaseStaleRunning(db);
@@ -98,7 +112,31 @@ if (cmd === "key" && sub === "init") {
   applyStoredSettings(cfg, db, key);
   const oauth = oauthCtx();
   const rt = runtimeFactory(cfg, db, key, oauth);
-  if (cmd === "review") {
+  const flag = (name: string) => { const i = rest.indexOf(name); return i >= 0 ? rest[i + 1] : undefined; };
+  if (cmd === "review-branch") {
+    const [branch] = rest;
+    if (!validProjectRef(sub) || !validBranchName(branch)) die(USAGE);
+    const base = flag("--base");
+    if (base !== undefined && !validBranchName(base)) die("--base is not a valid branch name");
+    const users = listUsers(db);
+    const user = rest.includes("--user") ? getUser(db, flag("--user") ?? "") : users.length === 1 ? users[0] : users.find((u) => u.isOwner);
+    if (!user) die("no matching user (use --user <username>; see `user list`)");
+    const engine = flag("--engine");
+    if (engine !== undefined && !(ENGINES as readonly string[]).includes(engine)) die(`--engine must be one of ${ENGINES.join("|")}`);
+    const runUser = engine ? { ...user!, engine: engine as User["engine"] } : user!;
+    // --json: stdout carries only the result, so route progress logs (e.g. [repo] fetch timing) to stderr.
+    const write = process.stdout.write.bind(process.stdout);
+    if (rest.includes("--json")) console.log = (...a: unknown[]) => console.error(...a);
+    const r = await rt(runUser);
+    const target = { project: sub!, branch: branch!, base };
+    let res: BranchResult;
+    try {
+      res = await runBranchReview(cfg, runUser, r, target, await resolveBranch(r, target));
+    } catch (e) {
+      die((e as Error).message);
+    }
+    write(`${rest.includes("--json") ? JSON.stringify(branchResultJson(res!), null, 2) : formatBranchResult(res!)}\n`);
+  } else if (cmd === "review") {
     // Dev aid: review an arbitrary MR (e.g. an already-merged one). Always dry-run.
     cfg.dryRun = true;
     const projectId = Number(sub);

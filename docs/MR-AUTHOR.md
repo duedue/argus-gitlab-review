@@ -12,6 +12,8 @@ For people who open MRs: how to make sure your reviewer's Argus can review your 
 
 Every new commit you push gets another review round. It covers only what changed since the last review and tracks whether issues from earlier rounds were fixed. After you merge the target branch into your branch, that round re-reads the whole MR (lines are counted from the MR's actual changes, excluding commits that came in from the target).
 
+**Self-review before you open the MR**: every push after the MR is open counts as a review round, so it is best to run a branch review on your branch first (call `POST /api/review-branch`; the `review-branch` CLI on the Argus host is only a development aid and should not be used while the server is busy; see the [user guide](USER-GUIDE.md) for usage), fix what it finds, and then open the MR. It returns the result only to you: it leaves no comments on GitLab and does not affect later reviews of the MR.
+
 ## 2. MR size limit: set per reviewer (default 2000 lines, adjustable 500-8000)
 
 Each reviewer sets the limit on their own settings page. When an MR exceeds it, the note states that reviewer's actual limit.

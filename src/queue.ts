@@ -17,6 +17,10 @@ export class ReviewQueue {
     if (!Number.isInteger(limit) || limit < 1) throw new Error("queue concurrency must be an integer >= 1");
   }
 
+  has(key: string): boolean {
+    return this.pending.has(key);
+  }
+
   /** `queued:false` means an identical item is already queued/running; `done` then settles with that one. */
   enqueue(lane: number, key: string, job: () => Promise<void>): { queued: boolean; done: Promise<void> } {
     const existing = this.pending.get(key);

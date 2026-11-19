@@ -164,7 +164,7 @@ export async function prepareDiff(opts: {
   token: string;
   repoUrl: string; // http_url_to_repo, no credentials
   projectId: number;
-  iid: number;
+  iid?: number; // omitted for a branch review (no MR ref exists): the head is then fetched by sha
   baseSha: string;
   headSha: string;
   lastReviewedSha?: string;
@@ -180,7 +180,7 @@ export async function prepareDiff(opts: {
 
   const fetch = (ref: string) => git(dir, ["fetch", "-q", "--depth=1", "--no-tags", opts.repoUrl, ref], opts.token);
   const fetchStart = Date.now();
-  await fetch(`refs/merge-requests/${opts.iid}/head`);
+  if (opts.iid !== undefined) await fetch(`refs/merge-requests/${opts.iid}/head`);
   await fetch(opts.baseSha);
   // A pinned head (dev `--head`) may predate the MR ref's tip: fetch it by sha when missing.
   await git(dir, ["cat-file", "-e", `${opts.headSha}^{commit}`], opts.token).catch(() => fetch(opts.headSha));
@@ -200,7 +200,7 @@ export async function prepareDiff(opts: {
       // last reviewed commit gone (force push / gc): fall back to full MR diff
     }
   }
-  console.log(`[repo] u${opts.ownerId}/${opts.projectId} !${opts.iid}: fetch phase ${Date.now() - fetchStart} ms`);
+  console.log(`[repo] u${opts.ownerId}/${opts.projectId} ${opts.iid === undefined ? "branch" : `!${opts.iid}`}: fetch phase ${Date.now() - fetchStart} ms`);
   await git(dir, ["checkout", "-q", "--force", "--detach", opts.headSha], opts.token);
 
   const names = (await git(dir, ["diff", "--name-only", "-z", from, opts.headSha], opts.token))
