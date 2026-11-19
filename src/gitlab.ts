@@ -91,11 +91,16 @@ export class GitLab {
     return this.paged(`/merge_requests?reviewer_id=${userId}&state=opened&scope=all`);
   }
 
+  /** `updatedAfter` (ISO) keeps the list short: an MR opened after a branch review was updated after it. */
+  listAuthoredMrs(userId: number, updatedAfter?: string): Promise<MrSummary[]> {
+    return this.paged(`/merge_requests?author_id=${userId}&state=opened&scope=all${updatedAfter ? `&updated_after=${encodeURIComponent(updatedAfter)}` : ""}`);
+  }
+
   listAssignedMrs(userId: number): Promise<MrSummary[]> {
     return this.paged(`/merge_requests?assignee_id=${userId}&state=opened&scope=all`);
   }
 
-  /** The user's recent branch push events, newest first. `after` is a YYYY-MM-DD date (GitLab filters by day). */
+  /** The user's recent branch push events, newest first. `after` is a YYYY-MM-DD date, exclusive (GitLab filters by day). */
   listPushEvents(userId: number, after: string): Promise<PushEvent[]> {
     return this.paged(`/users/${userId}/events?action=pushed&after=${after}`);
   }

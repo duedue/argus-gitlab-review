@@ -4,13 +4,16 @@ import { randomBytes } from "node:crypto";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { laneFor } from "../src/engine.ts";
 import { loadConfig } from "../src/config.ts";
-import { insertBranchReview, openDb } from "../src/db.ts";
+import { insertBranchReview, oldestUnattachedBranchReviewAt, openDb } from "../src/db.ts";
 import type { GitLab, PushEvent } from "../src/gitlab.ts";
+import Database from "better-sqlite3";
+import { pollOnce } from "../src/review.ts";
 import { PUSH_DEBOUNCE_MS, pollPushedBranches } from "../src/pushreview.ts";
 import { ReviewQueue } from "../src/queue.ts";
 import type { UserRuntime } from "../src/review.ts";
-import { addUser, getUser, setUser } from "../src/users.ts";
+import { addUser, engineFields, getUser, setUser } from "../src/users.ts";
 
 const key = randomBytes(32);
 const skillDir = mkdtempSync(join(tmpdir(), "skill-"));
@@ -20,7 +23,7 @@ const ev = (branch: string, sha: string, minsAgo: number, over: Partial<PushEven
   project_id: project, created_at: new Date(NOW - minsAgo * 60_000).toISOString(), push_data: { ref: branch, ref_type: "branch", action: "pushed", commit_to: sha, ...over },
 });
 
-function setup(o: { settings?: string[]; events?: PushEvent[]; mrs?: Record<string, number>; path?: string; tips?: Record<string, string>; engineHold?: boolean } = {}) {
+function setup(o: { projectFail?: () => Error | undefined; settings?: string[]; events?: PushEvent[]; mrs?: Record<string, number>; path?: string; tips?: Record<string, string>; engineHold?: boolean } = {}) {
   const db = openDb(":memory:");
   addUser(db, key, { gitlabUserId: 1, username: "alice", token: "t", tokenExpiresAt: null, skillPath: join(skillDir, "SKILL.md"), isOwner: false });
   setUser(db, "alice", o.settings ?? ["review_pushed_branches=1", "review_all_projects=1"]);
@@ -30,7 +33,7 @@ function setup(o: { settings?: string[]; events?: PushEvent[]; mrs?: Record<stri
   const calls: string[] = [];
   const gl = {
     listPushEvents: async () => (calls.push("events"), events),
-    getProject: async (id: number | string) => ({ id: Number(id), http_url_to_repo: "x", path_with_namespace: o.path ?? "g/p", default_branch: "main" }),
+    getProject: async (id: number | string) => { const err = o.projectFail?.(); if (err) throw err; return { id: Number(id), http_url_to_repo: "x", path_with_namespace: o.path ?? "g/p", default_branch: "main" }; },
     listBranchMrs: async (_p: number, b: string) => Array.from({ length: o.mrs?.[b] ?? 0 }, (_, i) => ({ iid: i + 1 })),
     getBranchSha: async (_p: number, b: string) => { if (!(b in tips)) throw Object.assign(new Error("nf"), { status: 404 }); return tips[b]!; },
     getMergeBase: async () => "m".repeat(40),
@@ -46,7 +49,7 @@ function setup(o: { settings?: string[]; events?: PushEvent[]; mrs?: Record<stri
   const deps = { cfg: loadConfig({ DATA_DIR: mkdtempSync(join(tmpdir(), "t-")), GITLAB_URL: "https://gl.test" }), db, queue, runtimeFor: async () => rt };
   const poll = async (now = NOW, user = u) => { const l = console.log; console.log = () => {}; try { await pollPushedBranches(deps, user, rt, now); await queue.idle(); } finally { console.log = l; } };
   const rows = () => db.prepare(`SELECT branch, head_sha, trigger, status FROM branch_reviews ORDER BY created_at, id`).all() as { branch: string; head_sha: string; trigger: string; status: string }[];
-  return { db, u, poll, rows, calls, engineRuns: () => engineRuns, setEvents: (e: PushEvent[]) => (events = e), tips };
+  return { db, u, deps, rt, queue, poll, rows, calls, engineRuns: () => engineRuns, setEvents: (e: PushEvent[]) => (events = e), tips };
 }
 const S = "s".repeat(40);
 
@@ -152,4 +155,123 @@ test("review_pushed_branches setting: 0/1 only, default off", () => {
   setUser(db, "alice", ["review_pushed_branches=1"]);
   assert.equal(getUser(db, "alice")!.reviewPushedBranches, true);
   assert.throws(() => setUser(db, "alice", ["review_pushed_branches=2"]), /review_pushed_branches/);
+});
+
+test("push: lane busy (someone's MR review queued/running) -> wait, then proceed; never queued behind MR work", async () => {
+  const t = setup({ events: [ev("feat", S, 10)], tips: { feat: S } });
+  let release!: () => void;
+  t.queue.enqueue(laneFor(engineFields(t.u), t.deps.cfg.ownerEngineTestUsers), "mr-review", () => new Promise<void>((r) => (release = r)));
+  await pollPushedBranches(t.deps, t.u, t.rt, NOW); // not t.poll(): that waits for the (blocked) queue to go idle
+  assert.equal(t.rows().length, 0);
+  assert.equal(t.queue.laneBusy(laneFor(engineFields(t.u), t.deps.cfg.ownerEngineTestUsers)), true);
+  release();
+  await t.queue.idle();
+  await t.poll();
+  assert.equal(t.rows().length, 1);
+});
+
+test("push: transient failures retry (3 attempts then give up with a log line); definitive ones drop at once", async () => {
+  let fail: Error | undefined = Object.assign(new Error("502 bad gateway"), { status: 502 });
+  const t = setup({ events: [ev("feat", S, 10)], tips: { feat: S }, projectFail: () => fail });
+  await t.poll(); await t.poll();
+  fail = undefined;
+  await t.poll();
+  assert.equal(t.rows().length, 1, "2 transient failures then success: still reviewed");
+
+  fail = Object.assign(new Error("502"), { status: 502 });
+  const g = setup({ events: [ev("feat", S, 10)], tips: { feat: S }, projectFail: () => fail });
+  const logs: string[] = [];
+  const l = console.log; console.log = (...a: unknown[]) => void logs.push(a.join(" "));
+  try { for (let i = 0; i < 3; i++) await pollPushedBranches(g.deps, g.u, g.rt, NOW); } finally { console.log = l; }
+  assert.ok(logs.some((x) => /gave up after 3 attempts/.test(x)));
+  fail = undefined;
+  await g.poll();
+  assert.equal(g.rows().length, 0, "given up: handled");
+
+  const nf = setup({ events: [ev("feat", S, 10)], tips: { feat: S }, projectFail: () => Object.assign(new Error("nf"), { status: 404 }) });
+  await nf.poll();
+  assert.equal((nf.db.prepare(`SELECT handled_sha FROM pushed_branches`).get() as { handled_sha: string }).handled_sha, S, "404 is definitive");
+});
+
+test("push: a changed head resets the attempt counter", async () => {
+  const t = setup({ events: [ev("feat", S, 10)], tips: { feat: S }, projectFail: () => Object.assign(new Error("x"), { status: 500 }) });
+  await t.poll(); await t.poll();
+  const T2 = "t".repeat(40);
+  t.setEvents([ev("feat", T2, 9)]);
+  await t.poll();
+  assert.equal((t.db.prepare(`SELECT attempts FROM pushed_branches`).get() as { attempts: number }).attempts, 1);
+});
+
+test("push: a stuck CLI 'running' row does not block the push trigger", async () => {
+  const t = setup({ events: [ev("feat", S, 10)], tips: { feat: S } });
+  insertBranchReview(t.db, { id: "cli-stuck", owner_id: 1, project_id: 9, project_path: "g/p", branch: "x", base: "main", merge_base: "m", head_sha: "x".repeat(40), trigger: "cli", status: "running" });
+  await t.poll();
+  assert.equal(t.rows().filter((r) => r.trigger === "push").length, 1);
+});
+
+test("push: config problems (401) wait without using attempts and log once; the head is reviewed once fixed", async () => {
+  let fail: Error | undefined = Object.assign(new Error("401 Unauthorized"), { status: 401 });
+  const t = setup({ events: [ev("feat", S, 10)], tips: { feat: S }, projectFail: () => fail });
+  const logs: string[] = [];
+  const l = console.log; console.log = (...a: unknown[]) => void logs.push(a.join(" "));
+  try { for (let i = 0; i < 5; i++) await pollPushedBranches(t.deps, t.u, t.rt, NOW); } finally { console.log = l; }
+  assert.equal((t.db.prepare(`SELECT attempts FROM pushed_branches`).get() as { attempts: number }).attempts, 0);
+  assert.equal(logs.filter((x) => /waiting/.test(x)).length, 1, "logged once");
+  fail = undefined;
+  await t.poll();
+  assert.equal(t.rows().length, 1);
+});
+
+test("push: a 401 on a GitLab lookup ends the cycle instead of trying every due branch", async () => {
+  let calls = 0;
+  const t = setup({ events: [ev("feat", S, 10), ev("feat2", S, 10)], tips: { feat: S, feat2: S }, projectFail: () => { calls++; return Object.assign(new Error("401 Unauthorized"), { status: 401 }); } });
+  const l = console.log; console.log = () => {};
+  try { await pollPushedBranches(t.deps, t.u, t.rt, NOW); } finally { console.log = l; }
+  assert.equal(calls, 1, "stopped after the first 401");
+  assert.equal(t.rows().length, 0);
+});
+
+test("push: dedupe includes the base: a manual review of this head against another base does not block the default-base push review", async () => {
+  const t = setup({ events: [ev("feat", S, 10)], tips: { feat: S } });
+  insertBranchReview(t.db, { id: "manual", owner_id: 1, project_id: 9, project_path: "g/p", branch: "feat", base: "develop", merge_base: "m", head_sha: S, trigger: "api" });
+  t.db.prepare(`UPDATE branch_reviews SET status='done'`).run();
+  await t.poll();
+  assert.deepEqual(t.rows().filter((r) => r.trigger === "push").length, 1);
+  const same = setup({ events: [ev("feat", S, 10)], tips: { feat: S } });
+  insertBranchReview(same.db, { id: "manual2", owner_id: 1, project_id: 9, project_path: "g/p", branch: "feat", base: "main", merge_base: "m", head_sha: S, trigger: "api" });
+  same.db.prepare(`UPDATE branch_reviews SET status='done'`).run();
+  await same.poll();
+  assert.equal(same.rows().filter((r) => r.trigger === "push").length, 0, "same base still dedupes");
+});
+
+test("pollOnce wires the push trigger: opted-in user gets a trigger='push' branch review after the debounce; opted-out gets none", async () => {
+  for (const [optIn, want] of [[true, 1], [false, 0]] as const) {
+    const t = setup({ settings: [`review_pushed_branches=${optIn ? 1 : 0}`, "review_all_projects=1"], events: [{ ...ev("feat", S, 0), created_at: new Date(Date.now() - 10 * 60_000).toISOString() }], tips: { feat: S } });
+    const gl = { ...(t.rt.gl as object), listReviewMrs: async () => [], listAssignedMrs: async () => [], listNotes: async () => [] } as unknown as GitLab;
+    const l = console.log; console.log = () => {};
+    try { await pollOnce(t.deps.cfg, t.db, [getUser(t.db, "alice")!], () => ({ ...t.rt, gl }), t.queue); await t.queue.idle(); } finally { console.log = l; }
+    assert.equal(t.rows().filter((r) => r.trigger === "push").length, want, `opt-in ${optIn}`);
+  }
+});
+
+test("migration: a dev DB with pushed_branches from the earlier revision (no attempts column) opens and works", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "mig-")), "t.db");
+  const old = new Database(path);
+  old.exec(`CREATE TABLE pushed_branches (owner_id INTEGER NOT NULL, project_id INTEGER NOT NULL, branch TEXT NOT NULL, head_sha TEXT NOT NULL, pushed_at INTEGER NOT NULL, handled_sha TEXT, PRIMARY KEY (owner_id, project_id, branch));
+    INSERT INTO pushed_branches VALUES (1, 9, 'b', 'h', 1, NULL);`);
+  old.close();
+  const db = openDb(path);
+  assert.equal((db.prepare(`SELECT attempts FROM pushed_branches`).get() as { attempts: number }).attempts, 0);
+});
+
+test("migration: an older branch_reviews table without attached_review_id opens and works", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "mig2-")), "t.db");
+  const RECENT = Date.now() - 1000;
+  const old = new Database(path);
+  old.exec(`CREATE TABLE branch_reviews (id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, project_id INTEGER NOT NULL, project_path TEXT NOT NULL, branch TEXT NOT NULL, base TEXT NOT NULL, merge_base TEXT NOT NULL, head_sha TEXT NOT NULL, status TEXT NOT NULL, verdict TEXT, findings_json TEXT, summary TEXT, error TEXT, trigger TEXT NOT NULL, created_at INTEGER NOT NULL, finished_at INTEGER);
+    INSERT INTO branch_reviews (id, owner_id, project_id, project_path, branch, base, merge_base, head_sha, status, verdict, trigger, created_at) VALUES ('a', 1, 9, 'g/p', 'b', 'main', 'm', 'h', 'done', 'approve', 'api', ${RECENT});`);
+  old.close();
+  const db = openDb(path);
+  assert.equal((db.prepare(`SELECT attached_review_id a FROM branch_reviews`).get() as { a: number | null }).a, null);
+  assert.equal(oldestUnattachedBranchReviewAt(db, 1), RECENT);
 });

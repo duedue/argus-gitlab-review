@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { createApiKey } from "../src/apikeys.ts";
 import { branchQueueKey, getBranchJob, resolveBranch, runBranchReview, validBranchName, validProjectRef } from "../src/branchreview.ts";
 import { loadConfig } from "../src/config.ts";
-import { activeBranchReview, claimReview, findDoneBranchReview, finishBranchReview, insertBranchReview, listBranchReviews, openDb, releaseStaleRunning, type BranchReviewRow } from "../src/db.ts";
+import { activeBranchReview, claimReview, failStaleCliBranchReviews, findDoneBranchReview, finishBranchReview, insertBranchReview, listBranchReviews, openDb, releaseStaleRunning, type BranchReviewRow } from "../src/db.ts";
 import type { ReviewEngine, ReviewInput } from "../src/engine.ts";
 import type { GitLab } from "../src/gitlab.ts";
 import { ReviewQueue } from "../src/queue.ts";
@@ -214,7 +214,7 @@ test("query helpers: newest-first keyset pagination, owner scoped; find done by 
   const db = openDb(":memory:");
   const mk = (id: string, owner: number, head: string, at: number, status: "done" | "failed" = "done") => {
     insertBranchReview(db, { id, owner_id: owner, project_id: 9, project_path: "g/p", branch: "b", base: "main", merge_base: "m", head_sha: head, trigger: "push" });
-    db.prepare(`UPDATE branch_reviews SET created_at=?, status=? WHERE id=?`).run(at, status, id);
+    db.prepare(`UPDATE branch_reviews SET created_at=?, status=?, verdict='approve' WHERE id=?`).run(at, status, id);
   };
   mk("a", 1, "h1", 100); mk("b", 1, "h2", 200); mk("c", 1, "h2", 200); mk("d", 1, "h3", 300, "failed"); mk("x", 2, "h1", 400);
   assert.deepEqual(listBranchReviews(db, 1).map((r) => r.id), ["d", "c", "b", "a"]);
@@ -291,4 +291,57 @@ test("api: coarse attempt limiter applies before any GitLab work, even to reject
   assert.equal(third.status, 429);
   assert.equal(((await third.json()) as { error: string }).error, "rate_limited");
   assert.equal(third.headers.get("retry-after"), "3600");
+});
+
+test("api: a leftover CLI running row does not block; an old queued/running API row still counts (the queue always ends it)", async () => {
+  const t = api();
+  insertBranchReview(t.db, { id: "cli-stuck", owner_id: 1, project_id: 9, project_path: "g/p", branch: "x", base: "main", merge_base: "m", head_sha: "x".repeat(40), trigger: "cli", status: "running" });
+  t.db.prepare(`UPDATE branch_reviews SET created_at=?`).run(Date.now() - 3_600_000);
+  const res = await t.post({ project: "g/p", branch: "feat" });
+  assert.equal(res.status, 202);
+  await t.queue.idle();
+  insertBranchReview(t.db, { id: "long-queued", owner_id: 1, project_id: 9, project_path: "g/p", branch: "y", base: "main", merge_base: "m", head_sha: "y".repeat(40), trigger: "api", status: "running" });
+  t.db.prepare(`UPDATE branch_reviews SET created_at=? WHERE id='long-queued'`).run(Date.now() - 3_600_000);
+  assert.equal((await t.post({ project: "g/p", branch: "feat" })).status, 429);
+});
+
+test("stale CLI runs are marked failed (interrupted); recent CLI and queue-owned rows are left alone", () => {
+  const db = openDb(":memory:");
+  const mk = (id: string, trigger: "cli" | "api", ageMin: number) => {
+    insertBranchReview(db, { id, owner_id: 1, project_id: 9, project_path: "g/p", branch: "b", base: "main", merge_base: "m", head_sha: id, trigger, status: "running" });
+    db.prepare(`UPDATE branch_reviews SET created_at=? WHERE id=?`).run(Date.now() - ageMin * 60_000, id);
+  };
+  mk("old-cli", "cli", 30); mk("new-cli", "cli", 5); mk("old-api", "api", 30);
+  assert.equal(failStaleCliBranchReviews(db), 1);
+  const st = Object.fromEntries((db.prepare(`SELECT id, status FROM branch_reviews`).all() as { id: string; status: string }[]).map((r) => [r.id, r.status]));
+  assert.deepEqual(st, { "old-cli": "failed", "new-cli": "running", "old-api": "running" });
+});
+
+test("api: GET /api/branch-reviews limit=100 gives a next cursor when there are more; fractional limit is safe", async () => {
+  const t = api();
+  for (let i = 0; i < 101; i++) {
+    insertBranchReview(t.db, { id: `00000000-0000-0000-0000-${String(i).padStart(12, "0")}`, owner_id: 1, project_id: 9, project_path: "g/p", branch: "b", base: "main", merge_base: "m", head_sha: "h", trigger: "push" });
+    t.db.prepare(`UPDATE branch_reviews SET status='done', created_at=? WHERE head_sha='h' AND created_at>=? AND id LIKE ?`).run(1000 + i, 0, `%${String(i).padStart(12, "0")}`);
+  }
+  const h = { authorization: `Bearer ${createApiKey(t.db, 1)}` };
+  const p = (await (await t.app.request("/api/branch-reviews?limit=100", { headers: h })).json()) as { items: unknown[]; next: string | null };
+  assert.equal(p.items.length, 100);
+  assert.ok(p.next, "101st row exists -> next");
+  const q = await t.app.request("/api/branch-reviews?limit=2.5", { headers: h });
+  assert.equal(q.status, 200);
+  assert.equal(((await q.json()) as { items: unknown[] }).items.length, 2);
+  const end = (await (await t.app.request(`/api/branch-reviews?limit=100&before=${p.next}`, { headers: h })).json()) as { items: unknown[]; next: string | null };
+  assert.deepEqual([end.items.length, end.next], [1, null]);
+});
+
+test("findDoneBranchReview filters base in SQL: an older row with the right base is found behind a newer one with another base", () => {
+  const db = openDb(":memory:");
+  for (const [id, base, at] of [["old", "main", 1], ["new", "develop", 2]] as const) {
+    insertBranchReview(db, { id, owner_id: 1, project_id: 9, project_path: "g/p", branch: "b", base, merge_base: "m", head_sha: "h", trigger: "api" });
+    finishBranchReview(db, id, { verdict: "approve", findingsJson: "{}" });
+    db.prepare(`UPDATE branch_reviews SET created_at=? WHERE id=?`).run(at, id);
+  }
+  assert.equal(findDoneBranchReview(db, 1, 9, "h")?.id, "new");
+  assert.equal(findDoneBranchReview(db, 1, 9, "h", "main")?.id, "old");
+  assert.equal(findDoneBranchReview(db, 1, 9, "h", "other"), undefined);
 });

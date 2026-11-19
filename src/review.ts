@@ -1,5 +1,5 @@
 import type { Config } from "./config.ts";
-import { acceptedIds, markAnnounced, carriedSummaryItems, claimReview, replaceSeenMrs, recordSkip, clearRetry, dueRetries, isSelfReview, failReview, releaseClaim, finishReview, findDoneBranchReview, pruneBranchReviews, lastReviewedBaseSha, lastReviewedSha, nextRound, recordBaseSha, type Db } from "./db.ts";
+import { acceptedIds, markAnnounced, carriedSummaryItems, claimReview, replaceSeenMrs, recordSkip, clearRetry, dueRetries, isSelfReview, failReview, releaseClaim, finishReview, findDoneBranchReview, failStaleCliBranchReviews, markBranchReviewAttached, oldestUnattachedBranchReviewAt, pruneBranchReviews, reviewExists, lastReviewedBaseSha, lastReviewedSha, nextRound, recordBaseSha, type Db } from "./db.ts";
 import { fetchRequirements } from "./jira.ts";
 import { deriveVerdict, type Finding, type Verdict } from "./findings.ts";
 import { chooseEngine, laneFor, reviewTimeoutMs, SHARED_LOGIN_LANE, SKIP_REASONS, type ReviewEngine } from "./engine.ts";
@@ -11,7 +11,7 @@ import { queueKey, reviewQueue, type ReviewQueue } from "./queue.ts";
 import { readProjectContext } from "./context.ts";
 import { cleanupDue, cloneUserIds, prepareDiff, pruneUserClones, removeUserClones } from "./repo.ts";
 import { pollPushedBranches } from "./pushreview.ts";
-import { parseMrUrl, reviewAllowed } from "./projects.ts";
+import { parseMrUrl, projectAllowed, reviewAllowed } from "./projects.ts";
 import { daysUntilExpiry, engineFields, listUsers, type User } from "./users.ts";
 
 /** Everything one user's review needs. `engine` is undefined when the subscription guard denies this user. */
@@ -76,6 +76,8 @@ async function cleanupClones(cfg: Config, u: User, queue: ReviewQueue): Promise<
 async function pruneOrphans(cfg: Config, db: Db, queue: ReviewQueue): Promise<void> {
   try {
     if (!cleanupDue("orphans")) return;
+    db.prepare(`DELETE FROM pushed_branches WHERE owner_id NOT IN (SELECT gitlab_user_id FROM users WHERE review_pushed_branches=1)`).run(); // opted out or removed users
+    failStaleCliBranchReviews(db);
     const n = pruneBranchReviews(db);
     if (n) console.log(`[cleanup] removed ${n} branch review(s) past retention`);
     const known = new Set(listUsers(db).map((u) => u.gitlabUserId)); // the full DB list, never the per-cycle filtered one (setup mode drops OAuth users)
@@ -133,6 +135,7 @@ async function pollUser(cfg: Config, db: Db, u: User, runtimeFor: (u: User) => U
     }
     const outside = mrs.filter((s) => !isDraft(s)).length - todo.length;
     if (outside) console.log(`[poll] ${u.username}: ${outside} skipped (not in project list)`);
+    await attachAuthoredMrs(cfg, db, u, rt, queue, new Set(mrs.map((m) => m.id)));
     await sweepRetries(cfg, db, u, rt, queue);
     try {
       await watchAccepts(cfg, db, u, rt, mrs, queue); // `/argus accept` commands usually arrive without a new commit
@@ -148,6 +151,37 @@ async function pollUser(cfg: Config, db: Db, u: User, runtimeFor: (u: User) => U
     console.error(`[poll] ${u.username} failed:`, (e as Error).message);
   } finally {
     await cleanupClones(cfg, u, queue); // also when the poll failed early (no skill, expired token, GitLab down)
+  }
+}
+
+/**
+ * The user's own open MRs get no automatic review, but a done branch review of the same head against the MR's target is
+ * posted as the review (attach-only: when nothing matches, the MR is left alone). Needs a done branch review to exist at all
+ * (one cheap DB check), then the user's project allowlist applies as for any automatic trigger.
+ */
+const ATTACH_SLACK_MS = 10 * 60_000; // review start minus this: covers GitLab/Argus clock skew
+const ATTACH_MAX_FAILURES = 3;
+/** Permanent attach failures (e.g. 403 on the note) per owner:mr:head; in memory, so a restart or a new head tries again. */
+const attachFailures = new Map<string, number>();
+
+async function attachAuthoredMrs(cfg: Config, db: Db, u: User, rt: UserRuntime, queue: ReviewQueue, listed: Set<number>): Promise<void> {
+  try { // never lets a failure here skip the retry sweep, accept watch or push trigger
+    // Gate: only while an attachable branch review has not been picked up yet, and only MRs updated since it STARTED (an MR
+    // opened while the review was still running is updated before it finished). Ceiling: a review whose MR is never opened
+    // keeps this narrowed list running for 14 days (the gate itself closes then; retention deletes the review after 90).
+    const oldest = oldestUnattachedBranchReviewAt(db, u.gitlabUserId);
+    if (oldest === undefined) return;
+    const since = oldest - ATTACH_SLACK_MS;
+    for (const s of await rt.gl.listAuthoredMrs(u.gitlabUserId, new Date(since).toISOString())) {
+      if (listed.has(s.id) || isDraft(s) || s.author?.id !== u.gitlabUserId) continue; // listed ones go through the normal path
+      if (!projectAllowed(parseMrUrl(s.web_url, cfg.gitlabUrl)?.path, u.reviewProjects, u.reviewAllProjects)) continue;
+      if (!findDoneBranchReview(db, u.gitlabUserId, s.project_id, s.sha, s.target_branch) || nextRound(db, u.gitlabUserId, s.id, cfg.dryRun) !== 1) continue;
+      if (reviewExists(db, u.gitlabUserId, s.id, s.sha, cfg.dryRun)) continue; // already claimed/failed/skipped for this head: no claim attempt, no log noise
+      if ((attachFailures.get(`${u.gitlabUserId}:${s.id}:${s.sha}`) ?? 0) >= ATTACH_MAX_FAILURES) continue;
+      await queue.enqueue(laneFor(engineFields(u), cfg.ownerEngineTestUsers), queueKey(u.gitlabUserId, s.id, s.sha), () => reviewMr(cfg, db, u, rt, s, undefined, { attachOnly: true })).done;
+    }
+  } catch (e) {
+    console.error(`[poll] ${u.username}: attaching branch reviews failed:`, (e as Error).message);
   }
 }
 
@@ -195,7 +229,7 @@ export function parseHeadSha(v: string | undefined): string {
  * Review a single MR as `user`. Never throws; failures are recorded in the DB.
  * `headOverride` (dev aid, dry-run only): review the MR as of that commit instead of its current head.
  */
-export async function reviewMr(cfg: Config, db: Db, user: User, rt: UserRuntime, s: MrSummary, headOverride?: string, opts: { selfReview?: boolean } = {}): Promise<void> {
+export async function reviewMr(cfg: Config, db: Db, user: User, rt: UserRuntime, s: MrSummary, headOverride?: string, opts: { selfReview?: boolean; attachOnly?: boolean } = {}): Promise<void> {
   const dryRun = cfg.dryRun; // snapshot: a web toggle mid-review must not split one review across both modes
   if (headOverride) {
     if (!dryRun) return void console.error("[review] headOverride is dry-run only; refusing");
@@ -206,7 +240,7 @@ export async function reviewMr(cfg: Config, db: Db, user: User, rt: UserRuntime,
   // No engine (engine.ts chooseEngine): record a visible "skipped" row with the reason. That row is re-claimable by
   // claimReview, so the MR is reviewed as soon as an engine exists (e.g. the user pastes a Claude token), no new push needed.
   const engine = rt.engine;
-  if (!engine) {
+  if (!engine && !opts.attachOnly) {
     const c = chooseEngine(engineFields(user), cfg.ownerEngineTestUsers);
     const reason = c.kind === "none" ? c.reason : "engine_unavailable";
     console.log(`[review] ${tag} skipped: no engine (${reason})`);
@@ -238,9 +272,11 @@ export async function reviewMr(cfg: Config, db: Db, user: User, rt: UserRuntime,
     }
     if (headOverride) Object.assign(mr, { sha: headOverride, diff_refs: { ...mr.diff_refs, head_sha: headOverride } });
     // The author's own done branch review of this exact head against this MR's target branch is posted as the review
-    // (summary only, never auto-approves) instead of running the engine again; a later head reviews normally.
-    const pre = persist && mr.author?.id === me ? findDoneBranchReview(db, me, s.project_id, mr.sha) : undefined;
-    const stored = pre && pre.base === mr.target_branch && pre.findings_json ? (JSON.parse(pre.findings_json) as { findings: Finding[]; belowThreshold: Finding[]; skipped?: string }) : undefined;
+    // (summary only, never auto-approves) instead of running the engine; a later head reviews normally. Only on an MR
+    // without review history (the first round): later rounds keep their tracking, carried items and accepted findings.
+    // One sha throughout: the claimed one (s.sha); if the MR head moved since the listing, do not attach.
+    const pre = persist && mr.sha === s.sha && mr.author?.id === me && nextRound(db, me, s.id, dryRun) === 1 ? findDoneBranchReview(db, me, s.project_id, s.sha, mr.target_branch) : undefined;
+    const stored = pre?.findings_json ? (JSON.parse(pre.findings_json) as { findings: Finding[]; belowThreshold: Finding[]; skipped?: string }) : undefined;
     if (pre && stored && !stored.skipped) {
       const all = [...stored.findings, ...stored.belowThreshold];
       const verdict = (pre.verdict as Verdict | null) ?? deriveVerdict(all);
@@ -248,8 +284,20 @@ export async function reviewMr(cfg: Config, db: Db, user: User, rt: UserRuntime,
       const ctx = { round: 1, sha: mr.sha, language: user.language, verdict, summary: pre.summary ?? undefined, checked: [], preMr: { head: pre.head_sha, mergeBase: pre.merge_base, base: pre.base, at: pre.finished_at ?? pre.created_at } };
       const summaryOnly = await publish(rt.gl, mr, all, pub, undefined, ctx);
       const summaryOpen = summaryOnly.map((f) => ({ id: fp(f), file: f.file, line: f.line, title: f.title }));
-      finish(db, me, s.id, s.sha, dryRun, "done", { findings: { findings: all, verdict, summaryOpen, unfixedPrev: [] } });
+      // The note is already posted here: if finishing throws, the claim is released and a retry can post a duplicate summary (rare, accepted).
+      db.transaction(() => {
+        finish(db, me, s.id, s.sha, dryRun, "done", { findings: { findings: all, verdict, summaryOpen, unfixedPrev: [] } });
+        // Like a normal round: the merge-base this review stands on, so a later target merge makes the next round a full diff.
+        recordBaseSha(db, me, s.id, s.sha, dryRun, mr.diff_refs.base_sha);
+        if (!dryRun) markBranchReviewAttached(db, pre.id, me, s.id, s.sha); // dry-run posts nothing: a later live run must still attach
+      })();
+      attachFailures.delete(`${me}:${s.id}:${s.sha}`);
       console.log(`[review] ${tag} attached pre-MR branch review ${pre.id} (${verdict}), ${all.length} finding(s); no engine run, no auto-approve`);
+      return;
+    }
+    if (opts.attachOnly || !engine) {
+      // Attach-only (authored MR, not opted in to reviews): nothing to attach -> leave no trace so a later branch review can still attach.
+      if (persist) releaseClaim(db, me, s.id, s.sha, dryRun);
       return;
     }
     const project = await rt.gl.getProject(s.project_id);
@@ -343,6 +391,16 @@ export async function reviewMr(cfg: Config, db: Db, user: User, rt: UserRuntime,
     const msg = (e as Error).message;
     console.error(`[review] ${tag} FAILED: ${msg}`);
     if (!persist) return;
+    if (opts.attachOnly) {
+      // Attach-only on an authored MR: leave no row (no retry sweep, no failure note); the next poll tries the attach again.
+      releaseClaim(db, me, s.id, s.sha, dryRun);
+      const k = `${me}:${s.id}:${s.sha}`;
+      if (attachFailures.size > 1000) attachFailures.clear();
+      const n = (attachFailures.get(k) ?? 0) + 1;
+      attachFailures.set(k, n);
+      if (n >= ATTACH_MAX_FAILURES) console.error(`[review] ${tag} attach failed ${n} times; giving up until the head changes or Argus restarts`);
+      return;
+    }
     const { attempts, final } = failReview(db, me, s.id, s.sha, dryRun, msg);
     if (!final) return console.log(`[review] ${tag} attempt ${attempts} failed; automatic retry scheduled`);
     // Final failure: tell the MR (best-effort, never in dry-run) so it is not silently stuck.
