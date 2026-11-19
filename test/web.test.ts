@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { serve } from "@hono/node-server";
 import Database from "better-sqlite3";
 import { loadConfig } from "../src/config.ts";
-import { openDb, type Db } from "../src/db.ts";
+import { finishBranchReview, insertBranchReview, openDb, type Db } from "../src/db.ts";
 import { decrypt } from "../src/crypto.ts";
 import { accessTokenFor, REFRESH_SKEW_MS, type OAuthCtx } from "../src/oauth.ts";
 import { pollCycle } from "../src/runtime.ts";
@@ -524,4 +524,78 @@ test("docs: Docker image ships docs/", () => {
   const root = new URL("../", import.meta.url);
   assert.match(readFileSync(new URL("Dockerfile", root), "utf8"), /^COPY .*\bdocs \.\/docs$/m);
   assert.ok(!readFileSync(new URL(".dockerignore", root), "utf8").split("\n").some((l) => /^\/?docs\/?$/.test(l.trim())));
+});
+
+// --- branch reviews UI ---
+const seedBranch = (db: Db, owner: number, id: string, head: string, findings = true) => {
+  insertBranchReview(db, { id, owner_id: owner, project_id: 9, project_path: "g/p", branch: "feat/x", base: "main", merge_base: "mb123456789", head_sha: head, trigger: "push" });
+  finishBranchReview(db, id, {
+    verdict: "request_changes", summary: "needs work",
+    findingsJson: JSON.stringify({ findings: findings ? [{ severity: "major", file: "a.ts", line: 3, title: "Bad thing", body: "why", confidence: 0.9 }] : [], belowThreshold: [{ severity: "nit", file: "b.ts", title: "Tiny", body: "meh", confidence: 0.4 }] }),
+  });
+};
+
+test("reviews: branch tab is a query param, MR tab stays default, rows link to compare and attached MR", async () => {
+  const { app, db } = setup();
+  upsertOAuthUser(db, key, { gitlabUserId: 7, username: "bu", accessToken: "a", refreshToken: "r", accessExpiresAt: Date.now() + 1e7 });
+  const s = loginAs(db, 7);
+  const get = async (q: string) => (await app.request(`/reviews${q}`, { headers: { cookie: s.cookie } })).text();
+  assert.match(await get(""), /aria-current="page">MR 審查/);
+  const empty = await get("?tab=branch");
+  assert.match(empty, /aria-current="page">Branch 審查/);
+  assert.match(empty, /尚無 branch 審查紀錄/);
+  assert.match(empty, /href="\/docs\/guide"/);
+  seedBranch(db, 7, "11111111-1111-1111-1111-111111111111", "abcdef1234567890");
+  db.prepare(`INSERT INTO reviews (owner_id, project_id, mr_id, mr_iid, head_sha, dry_run, status, mr_url) VALUES (7, 9, 500, 42, 'abcdef1234567890', 1, 'done', ?)`).run(`${GL}/g/p/-/merge_requests/42`);
+  const html = await get("?tab=branch");
+  assert.match(html, /建議修改/);
+  assert.match(html, /href="https:\/\/gl\.test\/g\/p\/-\/compare\/mb123456789\.\.\.abcdef1234567890"/);
+  assert.match(html, /feat\/x → main/);
+  assert.match(html, /abcdef12/);
+  assert.match(html, />push</);
+  assert.match(html, /\(\+1\)/);
+  assert.match(html, /href="https:\/\/gl\.test\/g\/p\/-\/merge_requests\/42"[^>]*>→ !42/);
+  assert.match(html, /<th scope="col">結論/);
+});
+
+test("reviews: branch detail is limited to the row's owner and the Argus owner", async () => {
+  const { app, db } = setup();
+  upsertOAuthUser(db, key, { gitlabUserId: 7, username: "bu", accessToken: "a", refreshToken: "r", accessExpiresAt: Date.now() + 1e7 });
+  upsertOAuthUser(db, key, { gitlabUserId: 8, username: "other", accessToken: "a", refreshToken: "r", accessExpiresAt: Date.now() + 1e7 });
+  upsertOAuthUser(db, key, { gitlabUserId: 9, username: "boss", accessToken: "a", refreshToken: "r", accessExpiresAt: Date.now() + 1e7 });
+  db.prepare(`UPDATE users SET is_owner=1 WHERE gitlab_user_id=9`).run();
+  const id = "22222222-2222-2222-2222-222222222222";
+  seedBranch(db, 7, id, "feedface00000000");
+  const get = (uid: number, path: string) => app.request(path, { headers: { cookie: loginAs(db, uid).cookie } });
+  const own = await get(7, `/reviews/branch/${id}`);
+  assert.equal(own.status, 200);
+  const html = await own.text();
+  assert.match(html, /Bad thing/);
+  assert.match(html, /a\.ts:3/);
+  assert.match(html, /<details class="below">/);
+  assert.match(html, /Tiny/);
+  assert.equal((await get(9, `/reviews/branch/${id}`)).status, 200);
+  assert.equal((await get(8, `/reviews/branch/${id}`)).status, 404);
+  assert.equal((await get(7, `/reviews/branch/nope`)).status, 404);
+  // the other user's list does not show it
+  assert.doesNotMatch(await (await get(8, "/reviews?tab=branch")).text(), /feat\/x/);
+});
+
+test("settings: branch_daily_cap field renders default, saves, rejects out-of-range", async () => {
+  const { app, db } = setup();
+  upsertOAuthUser(db, key, { gitlabUserId: 7, username: "cap", accessToken: "a", refreshToken: "r", accessExpiresAt: Date.now() + 1e7 });
+  const s = loginAs(db, 7);
+  const page = () => Promise.resolve(app.request("/settings", { headers: { cookie: s.cookie } })).then((r) => r.text());
+  assert.match(await page(), /name="branch_daily_cap"[^>]*value="20"/);
+  assert.doesNotMatch(await page(), /name="review_pushed_branches"[^>]*checked/);
+  assert.equal((await postSettings(app, s, { branch_daily_cap: "0", review_pushed_branches: "1" })).status, 200);
+  assert.equal(getUserById(db, 7)!.reviewPushedBranches, true);
+  assert.match(await page(), /name="review_pushed_branches"[^>]*checked/);
+  assert.equal(getUserById(db, 7)!.branchDailyCap, 0);
+  assert.match(await page(), /name="branch_daily_cap"[^>]*value="0"/);
+  assert.equal((await postSettings(app, s, { branch_daily_cap: "1001" })).status, 400);
+  assert.equal(getUserById(db, 7)!.branchDailyCap, 0);
+  assert.equal((await postSettings(app, s, {})).status, 200); // absent cap keeps its value; unchecked box turns the option off
+  assert.equal(getUserById(db, 7)!.branchDailyCap, 0);
+  assert.equal(getUserById(db, 7)!.reviewPushedBranches, false);
 });

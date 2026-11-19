@@ -116,6 +116,7 @@ td form { margin: 0; }
 .badge-failed { background: var(--err-bg); color: var(--err-fg); }
 .badge-skipped { background: var(--neutral-bg); color: var(--neutral-fg); }
 .badge-running { background: var(--info-bg); color: var(--info-fg); }
+.badge-warn { background: var(--warn-bg); color: var(--warn-fg); }
 .badge-dryrun { background: var(--warn-bg); color: var(--warn-fg); border-style: dashed; }
 .badge-owner { background: var(--neutral-fg); color: var(--surface); }
 
@@ -272,3 +273,16 @@ input.code-input::placeholder { text-transform: none; letter-spacing: .04em; }
 .pm-act { display: flex; flex-wrap: wrap; gap: .5rem; }
 .proj-add { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-top: .75rem; }
 .proj-add input { flex: 1 1 14rem; }
+/* /reviews tabs, branch review detail */
+.tabs { display: flex; gap: .25rem; list-style: none; margin: 0 0 1rem; padding: 0; border-bottom: 1px solid var(--border); }
+.tabs a { display: block; padding: .45rem .9rem; text-decoration: none; color: var(--muted); border-bottom: 2px solid transparent; margin-bottom: -1px; font-weight: 600; }
+.tabs a[aria-current="page"] { color: var(--text); border-bottom-color: var(--accent); }
+.pager { margin-top: .75rem; }
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: .25rem 1rem; margin: 0 0 .75rem; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; overflow-wrap: anywhere; }
+.findings { list-style: none; margin: 0 0 1rem; padding: 0; display: grid; gap: .6rem; }
+.findings li { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: .6rem .85rem; }
+.findings p { margin: 0 0 .25rem; }
+.f-body { white-space: pre-wrap; overflow-wrap: anywhere; }
+.below > summary { cursor: pointer; margin-bottom: .6rem; }
