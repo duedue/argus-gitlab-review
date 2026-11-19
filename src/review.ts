@@ -10,6 +10,7 @@ import { claimedFixed, failureNote, fp, openAiThreads, publish, resolveThreads, 
 import { queueKey, reviewQueue, type ReviewQueue } from "./queue.ts";
 import { readProjectContext } from "./context.ts";
 import { cleanupDue, cloneUserIds, prepareDiff, pruneUserClones, removeUserClones } from "./repo.ts";
+import { pollPushedBranches } from "./pushreview.ts";
 import { parseMrUrl, reviewAllowed } from "./projects.ts";
 import { daysUntilExpiry, engineFields, listUsers, type User } from "./users.ts";
 
@@ -137,6 +138,11 @@ async function pollUser(cfg: Config, db: Db, u: User, runtimeFor: (u: User) => U
       await watchAccepts(cfg, db, u, rt, mrs, queue); // `/argus accept` commands usually arrive without a new commit
     } catch (e) {
       console.error(`[poll] ${u.username}: accept watch failed:`, (e as Error).message);
+    }
+    try {
+      await pollPushedBranches({ cfg, db, queue, runtimeFor: async () => rt }, u, rt); // after the MR work; stores results only
+    } catch (e) {
+      console.error(`[poll] ${u.username}: push trigger failed:`, (e as Error).message);
     }
   } catch (e) {
     console.error(`[poll] ${u.username} failed:`, (e as Error).message);

@@ -157,7 +157,7 @@ export interface BranchDeps {
 }
 
 /** Validates against GitLab synchronously (fast), then queues the slow review in the caller's lane. */
-export async function startBranchReview(d: BranchDeps, caller: User, t: BranchTarget, charge: () => boolean = () => true): Promise<BranchJob> {
+export async function startBranchReview(d: BranchDeps, caller: User, t: BranchTarget, charge: () => boolean = () => true, trigger: BranchReviewTrigger = "api"): Promise<BranchJob> {
   if (!caller.skillPath) throw new BranchError(400, "no_skill_uploaded");
   let rt: UserRuntime;
   try {
@@ -179,7 +179,7 @@ export async function startBranchReview(d: BranchDeps, caller: User, t: BranchTa
   if (d.queue.has(qkey)) throw new BranchError(429, "too_many_active");
   if (!charge()) throw new BranchError(429, "rate_limited"); // charged only when a job is really created
   const id = randomUUID();
-  insertBranchReview(d.db, { id, owner_id: caller.gitlabUserId, project_id: r.projectId, project_path: r.projectPath, branch: t.branch, base: r.base, merge_base: r.mergeBase, head_sha: r.head, trigger: "api" });
+  insertBranchReview(d.db, { id, owner_id: caller.gitlabUserId, project_id: r.projectId, project_path: r.projectPath, branch: t.branch, base: r.base, merge_base: r.mergeBase, head_sha: r.head, trigger });
   d.queue.enqueue(laneFor(engineFields(caller), d.cfg.ownerEngineTestUsers), qkey, async () => {
     setBranchReviewRunning(d.db, id);
     try {

@@ -22,6 +22,12 @@ export interface MrSummary {
   user_notes_count?: number;
 }
 
+export interface PushEvent {
+  project_id: number;
+  created_at: string;
+  push_data?: { ref?: string; ref_type?: string; action?: string; commit_to?: string | null };
+}
+
 export interface Mr extends MrSummary {
   diff_refs: DiffRefs; // GitLab returns null for a few seconds after creation; reviewMr waits for it
 }
@@ -87,6 +93,16 @@ export class GitLab {
 
   listAssignedMrs(userId: number): Promise<MrSummary[]> {
     return this.paged(`/merge_requests?assignee_id=${userId}&state=opened&scope=all`);
+  }
+
+  /** The user's recent branch push events, newest first. `after` is a YYYY-MM-DD date (GitLab filters by day). */
+  listPushEvents(userId: number, after: string): Promise<PushEvent[]> {
+    return this.paged(`/users/${userId}/events?action=pushed&after=${after}`);
+  }
+
+  /** Open MRs whose source is this branch (any author). */
+  listBranchMrs(projectId: number, branch: string): Promise<{ iid: number }[]> {
+    return this.paged(`/projects/${projectId}/merge_requests?state=opened&source_branch=${encodeURIComponent(branch)}`);
   }
 
   async getMr(projectId: number | string, iid: number): Promise<Mr> {
