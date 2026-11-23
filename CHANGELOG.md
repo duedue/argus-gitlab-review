@@ -2,6 +2,17 @@
 
 All notable changes to Argus are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). While Argus is pre-1.0, a minor version adds features and a patch version only fixes. Sections are added by the release workflow from `.changes/<version>.md`; see `docs/RELEASING.md`.
 
+## [0.4.0] - 2026-11-23
+
+### Added
+
+- **`GET /api/branch-status`** lets agents and scripts ask what to do with a branch before submitting a branch review: `?project=<group/project or id>&branch=<branch>[&base=<branch>]`, same API key, read-only, own records only. The response carries the branch's current `head`, the latest branch review for that head and base (`review`), the push-trigger state (`push`, when "review my pushed branches" is on) and an `advice` value:
+  - `done`: this head already has a finished or failed review (failed ones are not retried automatically).
+  - `running`: a review is queued or running; check again or poll `review.id`.
+  - `pending_push`: the push trigger will review this head shortly; wait instead of submitting.
+  - `submit`: send `POST /api/review-branch` yourself.
+- The status endpoint has its own limit of 600 calls per user per hour, separate from the submit budget, so polling never blocks a submission.
+
 ## [0.3.0] - 2026-11-19
 
 ### Added
