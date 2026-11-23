@@ -22,7 +22,8 @@ import { isDraft } from "../gitlab.ts";
 import { chooseEngine, laneFor } from "../engine.ts";
 import type { Finding } from "../findings.ts";
 import { attachedMrs, getBranchReviewById, listBranchReviews, type BranchReviewRow } from "../db.ts";
-import { BranchError, branchResultJson, getBranchJob, startBranchReview, validBranchName, validProjectRef } from "../branchreview.ts";
+import { branchStatus } from "../pushreview.ts";
+import { BranchError, branchResultJson, getBranchJob, resolveHead, startBranchReview, storedSummary, validBranchName, validProjectRef } from "../branchreview.ts";
 import { makeRateLimiter, parseMrUrl, TRIGGER_LIMIT_PER_HOUR, triggerReviews, TriggerError } from "../trigger.ts";
 import { DOCS, loadDocs, type DocKey } from "./docs.ts";
 import {
@@ -39,6 +40,7 @@ export interface WebDeps {
   queue?: ReviewQueue;
   triggerLimitPerHour?: number;
   branchAttemptsPerHour?: number;
+  branchStatusPerHour?: number;
   docsDir?: URL; // test seam: where the guides are read from
   // Test seam: one minimal `claude -p` with the pasted Claude token before it is saved (real call by default).
   verifyClaudeToken?: (u: User, token: string) => Promise<ConnectionTest>;
@@ -72,13 +74,15 @@ const NOTICES: Record<string, Notice> = {
 };
 
 export function createApp({
-  cfg, db, key, oauth, runtimeFor = runtimeFactory(cfg, db, key, oauth), queue = reviewQueue, triggerLimitPerHour = TRIGGER_LIMIT_PER_HOUR, branchAttemptsPerHour = 120, docsDir,
+  cfg, db, key, oauth, runtimeFor = runtimeFactory(cfg, db, key, oauth), queue = reviewQueue, triggerLimitPerHour = TRIGGER_LIMIT_PER_HOUR, branchAttemptsPerHour = 120, branchStatusPerHour = 600, docsDir,
   verifyClaudeToken = (u, token) => claudeTestConnection(cfg.claudeBin, u.model, { token: () => token, configDir: claudeConfigDir(cfg.dataDir, u.gitlabUserId) }),
 }: WebDeps): Hono<Env> {
   const app = new Hono<Env>();
   const triggerAllowed = makeRateLimiter(triggerLimitPerHour);
   // Coarse ceiling on branch-review attempts: the unmetered pre-checks still cost a token decrypt + GitLab calls.
   const branchAttemptAllowed = makeRateLimiter(branchAttemptsPerHour);
+  // Status polling has its own, larger budget so it can never lock a caller out of submitting.
+  const branchStatusAllowed = makeRateLimiter(branchStatusPerHour);
   // Engine status card: cached ~60s (each check spawns the CLI); the connection test costs a real model call, so 1 per 30s.
   const claudeStatus = ttlCache(60_000, () => claudeAuthStatus(cfg.claudeBin));
   const codexStatus = ttlCache(60_000, () => codexLoginStatus(cfg.codexBin));
@@ -451,6 +455,29 @@ export function createApp({
     return c.json({ id: j.id, status: j.status, project: j.project, branch: j.branch, base: j.base, head: j.head, error: j.error, ...(j.result ? branchResultJson(j.result) : { merge_base: j.mergeBase }) });
   });
 
+  // Read-only: does this branch head already have (or is about to get) a branch review? Own limiter (600/h/user), not the POST ones.
+  app.get("/api/branch-status", async (c) => {
+    const auth = apiCaller(c, false);
+    if ("res" in auth) return auth.res;
+    if (!branchStatusAllowed(String(auth.caller.gitlabUserId))) {
+      c.header("Retry-After", "3600"); // upper bound: the limiter is a rolling window
+      return c.json({ error: "rate_limited" }, 429);
+    }
+    const project = c.req.query("project"), branch = c.req.query("branch"), base = c.req.query("base");
+    if (!validProjectRef(project)) return c.json({ error: "invalid_project" }, 400);
+    if (!validBranchName(branch)) return c.json({ error: "invalid_branch" }, 400);
+    if (base !== undefined && !validBranchName(base)) return c.json({ error: "invalid_base" }, 400);
+    try {
+      const rt = await runtimeFor(auth.caller).catch(() => { throw new BranchError(401, "caller_token_invalid"); });
+      const r = await resolveHead(rt, { project, branch, base }, true);
+      const s = await branchStatus(db, cfg, auth.caller, rt, { projectId: r.project.id, projectPath: r.project.path_with_namespace, defaultBranch: r.project.default_branch, branch, base: r.base, head: r.head });
+      return c.json({ project_id: r.project.id, project_path: r.project.path_with_namespace, branch, base: r.base, head: r.head, ...s });
+    } catch (e) {
+      if (e instanceof BranchError) return c.json({ error: e.code }, e.status);
+      throw e;
+    }
+  });
+
   // The caller's stored branch reviews, newest first. `next` is the opaque cursor for the following page (null at the end).
   app.get("/api/branch-reviews", (c) => {
     const auth = apiCaller(c, false);
@@ -464,11 +491,11 @@ export function createApp({
     const last = page[page.length - 1];
     return c.json({
       items: page.map((r) => {
-        const stored = r.findings_json ? (JSON.parse(r.findings_json) as { findings: unknown[]; belowThreshold: unknown[]; skipped?: string }) : undefined;
+        const sum = storedSummary(r.findings_json);
         return {
           id: r.id, status: r.status, trigger: r.trigger, project_id: r.project_id, project_path: r.project_path, branch: r.branch, base: r.base, head: r.head_sha,
-          merge_base: r.merge_base, verdict: r.verdict, findings_count: stored?.findings.length ?? null, below_threshold_count: stored?.belowThreshold.length ?? null,
-          skipped: stored?.skipped ?? null, error: r.error, created_at: r.created_at, finished_at: r.finished_at,
+          merge_base: r.merge_base, verdict: r.verdict, findings_count: sum.findings_count, below_threshold_count: sum.below_threshold_count,
+          skipped: sum.skipped, error: r.error, created_at: r.created_at, finished_at: r.finished_at,
         };
       }),
       next: rows.length > limit && last ? `${last.created_at}:${last.id}` : null,

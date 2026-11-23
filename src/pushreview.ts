@@ -1,7 +1,7 @@
 import { laneFor } from "./engine.ts";
 import type { Config } from "./config.ts";
-import { startBranchReview, BranchError } from "./branchreview.ts";
-import type { Db } from "./db.ts";
+import { startBranchReview, storedSummary, BranchError } from "./branchreview.ts";
+import type { BranchReviewRow, Db } from "./db.ts";
 import type { ReviewQueue } from "./queue.ts";
 import { projectAllowed } from "./projects.ts";
 import type { UserRuntime } from "./review.ts";
@@ -16,6 +16,55 @@ const waitLogged = new Set<string>();
 const capLogged = new Set<string>(); // "owner:YYYY-MM-DD": log the cap once per day
 
 interface Deps { cfg: Config; db: Db; queue: ReviewQueue; runtimeFor: (u: User) => Promise<UserRuntime> }
+
+export type BranchAdvice = "done" | "running" | "pending_push" | "submit";
+/**
+ * Read-only answer to "does this head already have (or is about to get) a branch review?", for agents that just pushed.
+ * Deterministic: done/failed row for (owner, project, head, base) -> done; queued/running -> running; else pending_push when the
+ * user is opted in with cap > 0, the push row is for this head and not handled, the 24h push cap is not exhausted, now is before
+ * due_at + 2 poll cycles (past that the poller should have acted and did not), and the poller would really take it (base is the
+ * default branch, branch is not, project is in the user's list, no open MR, the user has a skill and an engine); otherwise submit.
+ * Ceiling: a push whose event the poller has not read yet has no row, so it reads "submit" until the next poll cycle.
+ */
+export async function branchStatus(
+  db: Db, cfg: Config, u: User, rt: UserRuntime,
+  t: { projectId: number; projectPath: string; defaultBranch?: string; branch: string; base: string; head: string }, now = Date.now(),
+) {
+  const me = u.gitlabUserId;
+  const review = db.prepare(`SELECT * FROM branch_reviews WHERE owner_id=? AND project_id=? AND head_sha=? AND base=? ORDER BY created_at DESC, id DESC LIMIT 1`)
+    .get(me, t.projectId, t.head, t.base) as BranchReviewRow | undefined;
+  const optedIn = u.reviewPushedBranches && u.branchDailyCap > 0;
+  const row = optedIn ? db.prepare(`SELECT head_sha, pushed_at, handled_sha FROM pushed_branches WHERE owner_id=? AND project_id=? AND branch=?`)
+    .get(me, t.projectId, t.branch) as { head_sha: string; pushed_at: number; handled_sha: string | null } | undefined : undefined;
+  const dueAt = row ? row.pushed_at + PUSH_DEBOUNCE_MS : null;
+  const handled = row ? row.handled_sha === t.head : false;
+  const used = optedIn ? (db.prepare(`SELECT COUNT(*) n FROM branch_reviews WHERE owner_id=? AND trigger='push' AND created_at > ?`).get(me, now - DAY_MS) as { n: number }).n : 0;
+  const capped = optedIn && used >= u.branchDailyCap;
+  let advice: BranchAdvice = "submit";
+  let waiting: string | undefined;
+  if (review) advice = review.status === "queued" || review.status === "running" ? "running" : "done";
+  else if (row && dueAt !== null && row.head_sha === t.head && !handled && now < dueAt + 2 * cfg.pollIntervalMs
+    // The poller only reviews: non-default branches, against the default base, in the user's project list, with no open MR.
+    && u.skillPath && rt.engine // the poller waits forever on a missing skill/engine (startBranchReview: no_skill_uploaded / no_review_engine)
+    && t.defaultBranch !== undefined && t.base === t.defaultBranch && t.branch !== t.defaultBranch
+    && projectAllowed(t.projectPath.toLowerCase(), u.reviewProjects, u.reviewAllProjects)) {
+    if (!capped) { // capped: not coming until the 24h window frees
+      const mrs = await rt.gl.listBranchMrs(t.projectId, t.branch).catch(() => undefined); // GitLab error: do not promise a review
+      if (mrs && !mrs.length) { advice = "pending_push"; waiting = now < dueAt ? "debounce" : "awaiting_poll"; }
+    }
+  }
+  return {
+    review: review ? {
+      id: review.id, status: review.status, trigger: review.trigger, verdict: review.verdict, ...storedSummary(review.findings_json),
+      created_at: review.created_at, finished_at: review.finished_at,
+    } : null,
+    push: optedIn ? {
+      opted_in: true, last_push_head: row?.head_sha ?? null, last_push_at: row?.pushed_at ?? null, due_at: dueAt, handled,
+      ...(waiting ? { waiting_reason: waiting } : {}),
+    } : null,
+    advice,
+  };
+}
 
 /**
  * Push trigger (opt-in users.review_pushed_branches): review the user's pushed branches that have no MR yet, store the
